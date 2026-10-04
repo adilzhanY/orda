@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a108fe-1a87-7d10-9a76-2e77f4097b2e"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll run `ls` in the current directory."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/usr/bin/bash -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/usr/bin/bash -lc ls","aggregated_output":"claude.err\nclaude.jsonl\ncodex.err\ncodex.jsonl\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":39860,"cached_input_tokens":31488,"cache_write_input_tokens":0,"output_tokens":68,"reasoning_output_tokens":10}}

@@ -1,0 +1,93 @@
+# orda settings. orda reloads this file while it runs.
+
+# "orda" (coral, blue and teal on dark grey) or "iris" (black and white).
+theme = "orda"
+
+# Override any theme colour with "#rrggbb". bg = "none" keeps the terminal's own background.
+# Keys: bg, text, bright, dim, line, badge, claude, codex, gemini, fable, ask, ok, bad
+[colors]
+# bg = "none"
+# claude = "#e8855a"
+
+[layout]
+# Modules: team, questions, git, web, guard, log, usage.
+# left is the wide column; its first module takes the spare height.
+left = ["team"]
+# right is a two-column grid, filled row by row.
+right = ["questions", "git", "web", "guard"]
+# bottom is one row under everything, modules side by side.
+bottom = ["log", "usage"]
+bottom_height = 9
+# Below this size orda shows one module at a time, as tabs.
+compact_width = 170
+compact_height = 44
+
+[notify]
+# Desktop notification (notify-send) when an agent asks you something.
+desktop = true
+
+[guard]
+# Blocked outright. "*" matches anything.
+deny = ["rm -rf /", "rm -rf ~", "rm -rf $HOME", "dd * of=/dev/*", "mkfs*", "curl * | sh", "curl * | bash", "wget * | sh", "chmod -R 777 /*"]
+# Pause that one agent and ask you. Every other agent keeps working.
+ask = ["git push*", "sudo *", "git reset --hard*", "rm -rf *"]
+
+# The team. role is "boss", "advisor" or "worker". vendor is "claude", "codex" or "gemini".
+[[agents]]
+name = "boss"
+role = "boss"
+vendor = "claude"
+model = "opus"
+effort = "high"
+job = "plans, routes, merges"
+
+[[agents]]
+name = "advisor"
+role = "advisor"
+vendor = "claude"
+model = "fable"
+effort = "high"
+job = "on call, never writes code"
+
+[[agents]]
+name = "builder"
+vendor = "codex"
+model = "gpt-6-sol"
+effort = "high"
+job = "implements tasks"
+
+[[agents]]
+name = "builder-2"
+vendor = "claude"
+model = "sonnet"
+effort = "medium"
+job = "implements tasks"
+
+[[agents]]
+name = "tester"
+vendor = "claude"
+model = "sonnet"
+effort = "medium"
+job = "tests whatever already landed"
+always_on = true
+
+[[agents]]
+name = "researcher"
+vendor = "gemini"
+model = "flash"
+effort = "low"
+job = "web research for the others"
+
+[[agents]]
+name = "reviewer"
+vendor = "codex"
+model = "gpt-6-sol"
+effort = "high"
+job = "reviews every commit"
+
+[[agents]]
+name = "scribe"
+vendor = "gemini"
+model = "flash"
+effort = "low"
+job = "keeps the four docs current"
