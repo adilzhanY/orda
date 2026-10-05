@@ -70,6 +70,32 @@ fn matches(pattern: &str, cmd: &str) -> bool {
     })
 }
 
+/// `orda hook`: Claude Code's PreToolUse hook. Reads the tool call on stdin and
+/// answers with a deny for commands the guard blocks or reserves for the owner.
+pub fn hook() {
+    let mut input = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    if let Some(reply) = decide(&crate::config::load().0.guard, &input) {
+        println!("{reply}");
+    }
+}
+
+fn decide(rules: &Guard, input: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(input).ok()?;
+    if v["tool_name"] != "Bash" {
+        return None;
+    }
+    let cmd = v["tool_input"]["command"].as_str()?;
+    let reason = match check(rules, cmd) {
+        Verdict::Allow => return None,
+        Verdict::Deny => "orda's guard blocks this command. Do not try another way around it; say what you needed it for in your report.".to_string(),
+        Verdict::Ask => "This command needs the owner's yes, and orda has asked them. Carry on with work that does not need it; if they allow it, you get it back as a task.".to_string(),
+    };
+    Some(serde_json::json!({
+        "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason }
+    }).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,6 +103,22 @@ mod tests {
 
     fn rules() -> Guard {
         crate::config::Config::default().guard
+    }
+
+    #[test]
+    fn hook_denies_only_what_the_guard_flags() {
+        let r = rules();
+        let call =
+            |cmd: &str| format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"{cmd}"}}}}"#);
+        let out = decide(&r, &call("rm -rf ~")).unwrap();
+        assert!(out.contains(r#""permissionDecision":"deny""#) && out.contains("blocks"));
+        assert!(
+            decide(&r, &call("git push origin main"))
+                .unwrap()
+                .contains("owner's yes")
+        );
+        assert!(decide(&r, &call("cargo test")).is_none());
+        assert!(decide(&r, r#"{"tool_name":"Edit","tool_input":{"file_path":"a"}}"#).is_none());
     }
 
     #[test]

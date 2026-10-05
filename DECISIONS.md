@@ -267,3 +267,18 @@ While designing it, thinking like aegis found a real hole in orda: the guard did
 **Decision:** with fourteen workers the team panel first shortens cards, then shrinks rows where nobody is working (idle, queued, done, no message in the air) to three-line cards that stay wired. A row grows back the moment one of its agents starts working or receives a card. Positions never change.
 
 **Deferred:** keel, pruner, pulse and mentor, with their evidence, are in IDEAS.md.
+
+## 25. Real mode: worktrees, checks that gate merges, an enforced guard
+
+2026-10-06
+
+**Context:** the user wants to type a task in any folder and watch the team build it.
+
+**Decision:**
+- **Worktrees.** Builders, the tester and the commit checkers each work in their own git worktree under `~/.local/share/orda/wt/<project>-<id>/<agent>`, on a branch `wt/<agent>`. Builders work in parallel without touching each other's files or the owner's checkout; checkers get a worktree set to exactly the commit they check. The boss and the doc keepers (anchor, curator, scribe) work in the project. Only the boss merges, into the main branch, and nobody pushes.
+- **Delegation through cards.** The boss hands out `task` cards; delivering a card starts the receiver. Builders answer with a `done` card.
+- **Checks gate merges.** orda records who is checking each builder commit; the boss is asked to merge only when the last check is in and nothing holds the commit. `FINISHED:` marks the whole task done.
+- **The guard is enforced.** Claude agents run with edits and shell allowed, and `orda hook` as a PreToolUse hook that denies guarded commands in every permission mode. Codex runs in its workspace-write sandbox. A new folder is made a git repo on the first task.
+- Researcher and scribe moved from Gemini to Claude until a Gemini adapter exists; the reviewer is now always on, since merges wait for its check.
+
+**Rejected:** one shared checkout for everyone (parallel builders would overwrite each other), merging on a builder's word (the whole point of the checks), Claude's `bypassPermissions` (the hook and acceptEdits give the same autonomy with a real guard).

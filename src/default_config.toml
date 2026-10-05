@@ -105,9 +105,9 @@ always_on = true
 [[agents]]
 name = "researcher"
 role = "researcher"
-vendor = "gemini"
-model = "flash"
-effort = "low"
+vendor = "claude"
+model = "sonnet"
+effort = "medium"
 job = "web research for the others"
 
 [[agents]]
@@ -117,12 +117,13 @@ vendor = "codex"
 model = "gpt-6.1-sol"
 effort = "high"
 job = "reviews every commit"
+always_on = true
 
 [[agents]]
 name = "scribe"
 role = "scribe"
-vendor = "gemini"
-model = "flash"
+vendor = "claude"
+model = "haiku"
 effort = "low"
 job = "keeps the four docs current"
 

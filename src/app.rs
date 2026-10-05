@@ -12,6 +12,7 @@ use crate::secrets;
 use crate::stats;
 use crate::theme::Theme;
 use crate::vendors::{self, AgentEvent, short};
+use crate::work;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -72,6 +73,8 @@ pub struct Agent {
     pub tools: u64,
     /// Tasks waiting for this agent's current run to end (new commits for the always-on agents).
     queue: VecDeque<String>,
+    /// The folder its current run works in: its worktree, or the project.
+    pub dir: std::path::PathBuf,
     /// Its REPORT lines from the current run, handed on when another agent needs them.
     last_report: String,
     /// The configured model while the agent covers a used-up limit on a fallback.
@@ -108,6 +111,7 @@ impl Agent {
             tools: 0,
             queue: VecDeque::new(),
             last_report: String::new(),
+            dir: std::path::PathBuf::new(),
             primary: None,
             run_id: 0,
             handle: None,
@@ -313,8 +317,7 @@ pub struct App {
     pub toast: Option<(String, String, Instant)>,
     pub frame: usize,
     pub started: Instant,
-    pub project: String,
-    cwd: String,
+    pub cwd: String,
     timers: [Instant; 4],
     pub quit: bool,
     /// vendor -> unix time its used-up limit resets
@@ -325,6 +328,9 @@ pub struct App {
     pub savings: Vec<savings::Rule>,
     /// Tokens per run this week against last week, "-12%".
     pub burn: Option<String>,
+    jobs_started: bool,
+    /// commit -> (its branch, agents still checking it); the boss is woken when it empties
+    pub checks: HashMap<String, (String, Vec<String>)>,
     /// The owner's current task and how far it is.
     pub flow: Option<(Stage, String)>,
     /// Commits already handed to the always-on agents and the scanner.
@@ -351,7 +357,6 @@ impl App {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let project = cwd.rsplit('/').next().unwrap_or("").to_string();
         let now = Instant::now();
         let mut app = Self {
             theme: Theme::build(&cfg.theme, &cfg.colors),
@@ -380,7 +385,6 @@ impl App {
             toast: None,
             frame: 0,
             started: now,
-            project,
             cwd,
             timers: [now; 4],
             quit: false,
@@ -390,6 +394,8 @@ impl App {
             burn: None,
             seen: Default::default(),
             flow: None,
+            jobs_started: false,
+            checks: HashMap::new(),
             messages: vec![],
             flights: vec![],
             digest: vec![],
@@ -403,11 +409,7 @@ impl App {
         } else {
             app.git = git::snapshot(&app.cwd);
             // only commits made from now on are new
-            app.seen = app
-                .git
-                .iter()
-                .flat_map(|g| g.commits.iter().map(|c| c.hash.clone()))
-                .collect();
+            app.seen = git::recent_all(&app.cwd).into_iter().map(|c| c.0).collect();
             app.remembered = load_answers(&app.cwd);
             app.savings = savings::load();
             app.burn = stats::trend(&stats::runs(), now_unix());
@@ -415,15 +417,13 @@ impl App {
                 a.status = Status::Queued;
                 a.now = "waits for the first commit".into();
             }
-            app.note("orda", "ready. press i and tell orda what to build");
-            let stale =
-                |job: &str, every: i64| stats::last_run(job).is_none_or(|t| now_unix() - t > every);
-            if stale("scout", SCOUT_EVERY) {
-                app.scan();
-            }
-            if stale("aegis-audit", AUDIT_EVERY) {
-                app.audit();
-            }
+            app.note(
+                "orda",
+                format!(
+                    "ready in {}. press i and tell orda what to build",
+                    tilde(&app.cwd)
+                ),
+            );
         }
         app
     }
@@ -714,6 +714,16 @@ impl App {
         self.note("you", format!("{}: {answer} ({where_})", q.from));
         if let Some(cmd) = &q.guard_cmd {
             let allowed = choice == 0;
+            if let Some(i) = self.agent_index(&q.from)
+                && allowed
+                && !self.demo_mode
+            {
+                let task = format!(
+                    "The owner allowed you to run this command once: `{cmd}`. Run it now, then carry on with your task:\n\n{}",
+                    self.agents[i].goal
+                );
+                self.queue_task(i, task);
+            }
             if let Some(i) = self.agent_index(&q.from) {
                 self.agents[i].status = Status::Running;
                 self.agents[i].now = if allowed {
@@ -774,6 +784,40 @@ impl App {
     fn submit(&mut self, task: String) {
         self.note("you", format!("task: {task}"));
         self.task = task.clone();
+        if !self.demo_mode {
+            match work::ensure_repo(std::path::Path::new(&self.cwd)) {
+                Ok(true) => {
+                    self.note(
+                        "orda",
+                        "this folder was not a git repo: made it one, with a first commit",
+                    );
+                    self.seen
+                        .extend(git::recent_all(&self.cwd).into_iter().map(|c| c.0));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    self.note(
+                        "orda",
+                        format!("orda needs a git repo here and could not make one: {e}"),
+                    );
+                    return;
+                }
+            }
+            self.git = git::snapshot(&self.cwd);
+            // the periodic reviews start with the first real task, not when orda opens
+            if !self.jobs_started {
+                self.jobs_started = true;
+                let stale = |job: &str, every: i64| {
+                    stats::last_run(job).is_none_or(|t| now_unix() - t > every)
+                };
+                if stale("scout", SCOUT_EVERY) {
+                    self.scan();
+                }
+                if stale("aegis-audit", AUDIT_EVERY) && git::recent_all(&self.cwd).len() > 3 {
+                    self.audit();
+                }
+            }
+        }
         if self.demo_mode {
             self.note(
                 "boss",
@@ -817,7 +861,35 @@ impl App {
             }
         }
         let task = task.as_str();
+        // agents that write code or check commits work in their own worktree
+        let dir = if work::in_worktree(&self.agents[i].def.role) && !self.demo_mode {
+            let main = self
+                .git
+                .as_ref()
+                .map(|g| g.branch.clone())
+                .filter(|b| !b.is_empty())
+                .unwrap_or("main".into());
+            let job = match task
+                .strip_prefix("New commit ")
+                .and_then(|t| t.split_whitespace().next())
+            {
+                Some(commit) => work::Job::Check { commit },
+                None => work::Job::Task { main: &main },
+            };
+            let name = self.agents[i].def.name.clone();
+            match work::prepare(std::path::Path::new(&self.cwd), &name, job) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.note(&name, format!("could not prepare its worktree: {e}"));
+                    self.agents[i].status = Status::Failed;
+                    return;
+                }
+            }
+        } else {
+            std::path::PathBuf::from(&self.cwd)
+        };
         let a = &mut self.agents[i];
+        a.dir = dir;
         a.goal = task.to_string();
         a.journal.clear();
         a.run = Some((Instant::now(), a.tokens_in, a.tokens_out, a.tools));
@@ -858,7 +930,8 @@ impl App {
         let lessons = roles::project_notes(&read("MAP.md"), &read("LESSONS.md"));
         let saving = savings::for_role(&self.savings, &d.role);
         let system = roles::instructions(&d, &team, &decided, &lessons, &saving);
-        a.handle = vendors::spawn(&d, &system, &prompt, self.tx.clone(), move |e| {
+        let dir = a.dir.clone();
+        a.handle = vendors::spawn(&d, &system, &prompt, &dir, self.tx.clone(), move |e| {
             Msg::Agent(i, id, e)
         });
     }
@@ -1073,8 +1146,25 @@ impl App {
                 .iter()
                 .filter(|m| m.thread == thread)
                 .collect();
+            // with the commit named, orda sets the referee's folder to it
+            let claimed = msgs
+                .last()
+                .map(|m| {
+                    m.card
+                        .get("commit")
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            let head = if claimed.is_empty() {
+                String::new()
+            } else {
+                format!("New commit {claimed} (claimed in #{id}). ")
+            };
             let task = format!(
-                "Verify this claim before anyone relies on it.\n\n{}",
+                "{head}Verify this claim before anyone relies on it.\n\n{}",
                 mail::prompt(&msgs, "referee")
             );
             self.queue_task(r, task);
@@ -1294,24 +1384,6 @@ impl App {
                 Some((Stage::Verifying, _)) => self.flow = None,
                 _ => {}
             },
-            "boss" => {
-                if let Some((Stage::Building, task)) = self.flow.clone() {
-                    let report = self.agents[i].last_report.clone();
-                    if let Some(k) = self.agents.iter().position(|a| a.def.role == "anchor") {
-                        self.flow = Some((Stage::Verifying, task.clone()));
-                        self.note("anchor", "checking every criterion has evidence");
-                        self.queue_task(k, format!("The boss reports this task finished. Check every acceptance criterion of it in SPEC.md has evidence.\n\nThe task:\n{task}\n\nThe boss's report:\n{report}"));
-                    }
-                }
-                // the map follows the code
-                if let Some(c) = self.agents.iter().position(|a| a.def.role == "curator") {
-                    self.queue_task(
-                        c,
-                        "The boss finished a task. Bring MAP.md up to date with what changed."
-                            .into(),
-                    );
-                }
-            }
             _ => {}
         }
     }
@@ -1338,15 +1410,15 @@ impl App {
 
     /// New commits since the last look: through the secret scanner, then to the always-on agents.
     fn watch_commits(&mut self) {
-        let Some(g) = &self.git else { return };
-        let fresh: Vec<(String, String)> = g
-            .commits
-            .iter()
+        if self.git.is_none() {
+            return;
+        }
+        // every branch, oldest first: builders commit on their own wt/ branches
+        let fresh: Vec<(String, String)> = git::recent_all(&self.cwd)
+            .into_iter()
             .rev()
-            .filter(|c| !self.seen.contains(&c.hash))
-            .map(|c| (c.hash.clone(), c.subject.clone()))
+            .filter(|c| !self.seen.contains(&c.0))
             .collect();
-        let branch = g.branch.clone();
         for (hash, subject) in fresh {
             self.seen.insert(hash.clone());
             let diff = git::show(&self.cwd, &hash);
@@ -1382,19 +1454,78 @@ impl App {
                     });
                 });
             }
-            if !self.cfg.watch.commits {
+            // empty commits and notes or docs need no checking crew
+            let docs_only = files.iter().all(|f| f.ends_with(".md"));
+            if !self.cfg.watch.commits || docs_only {
                 continue;
             }
+            let owners = work::owners(std::path::Path::new(&self.cwd), &hash);
+            let branch = owners
+                .first()
+                .map(|o| format!("wt/{o}"))
+                .or_else(|| self.git.as_ref().map(|g| g.branch.clone()))
+                .unwrap_or_default();
+            let mut pending = vec![];
             for i in 0..self.agents.len() {
                 let d = &self.agents[i].def;
-                // customs only cares about commits that change what comes in from outside
-                if d.always_on && (d.role != "customs" || manifest) {
+                // customs only cares about what comes in from outside; nobody checks their own commit
+                if d.always_on && (d.role != "customs" || manifest) && !owners.contains(&d.name) {
+                    pending.push(d.name.clone());
                     let task = format!(
-                        "New commit {hash} on {branch}: \"{subject}\". Check it as your role describes."
+                        "New commit {hash} on {branch}: \"{subject}\". Check it as your role describes. Your folder is set to this commit."
                     );
                     self.queue_task(i, task);
                 }
             }
+            if !pending.is_empty() && branch.starts_with("wt/") {
+                self.checks.insert(hash.clone(), (branch, pending));
+            }
+        }
+    }
+
+    /// An agent finished checking a commit: when every check is in and nothing holds it, wake the boss.
+    fn check_done(&mut self, who: &str, goal: &str) {
+        let Some(hash) = goal
+            .strip_prefix("New commit ")
+            .and_then(|t| t.split_whitespace().next())
+        else {
+            return;
+        };
+        let hash = hash.to_string();
+        if let Some((_, pending)) = self.checks.get_mut(&hash) {
+            pending.retain(|n| n != who);
+        }
+        self.maybe_merge(&hash);
+    }
+
+    fn maybe_merge(&mut self, hash: &str) {
+        let Some((branch, pending)) = self.checks.get(hash) else {
+            return;
+        };
+        if !pending.is_empty()
+            || self
+                .holds
+                .iter()
+                .any(|h| h.0.starts_with(hash) || hash.starts_with(h.0.as_str()))
+        {
+            return;
+        }
+        let branch = branch.clone();
+        self.checks.remove(hash);
+        let main = self
+            .git
+            .as_ref()
+            .map(|g| g.branch.clone())
+            .unwrap_or("main".into());
+        self.note(
+            "orda",
+            format!("{hash} passed every check, the boss can merge {branch}"),
+        );
+        if let Some(b) = self.agents.iter().position(|a| a.def.role == "boss") {
+            let task = format!(
+                "Commit {hash} on {branch} passed every check and nothing holds it. If the work on that branch is finished, merge it: `git merge --no-ff {branch}` while on {main}. Then hand out what is next, or report the task finished."
+            );
+            self.queue_task(b, task);
         }
     }
 
@@ -1671,6 +1802,33 @@ impl App {
                 self.holds
                     .retain(|h| !(h.0.starts_with(&commit) || commit.starts_with(&h.0)));
                 self.note(who, format!("released {commit}"));
+                let known: Vec<String> = self
+                    .checks
+                    .keys()
+                    .filter(|h| h.starts_with(&commit) || commit.starts_with(h.as_str()))
+                    .cloned()
+                    .collect();
+                for h in known {
+                    self.maybe_merge(&h);
+                }
+            }
+            roles::Line::Finished(summary) => {
+                self.note(who, format!("finished the task: {summary}"));
+                if let Some((Stage::Building, task)) = self.flow.clone()
+                    && let Some(k) = self.agents.iter().position(|a| a.def.role == "anchor")
+                {
+                    self.flow = Some((Stage::Verifying, task.clone()));
+                    self.note("anchor", "checking every criterion has evidence");
+                    self.queue_task(k, format!("The boss reports this task finished. Check every acceptance criterion of it in SPEC.md has evidence.\n\nThe task:\n{task}\n\nThe boss's summary:\n{summary}"));
+                }
+                // the map follows the code
+                if let Some(c) = self.agents.iter().position(|a| a.def.role == "curator") {
+                    self.queue_task(
+                        c,
+                        "The team finished a task. Bring MAP.md up to date with what changed."
+                            .into(),
+                    );
+                }
             }
             roles::Line::Save { scope, text } => {
                 if self.savings.iter().filter(|r| r.active).count() >= savings::MAX_ACTIVE {
@@ -1772,7 +1930,12 @@ impl App {
                 if matches!(tool.as_str(), "Bash" | "shell") {
                     let verdict = guard::check(&self.cfg.guard, &detail);
                     if verdict != Verdict::Allow {
-                        // ponytail: shown only; enforcement needs PreToolUse hooks (claude) and an exec policy (codex)
+                        // claude runs are stopped by `orda hook`; codex stays inside its sandbox
+                        let why = match (verdict, vendor.as_str()) {
+                            (Verdict::Deny, "codex") => "codex sandbox: only its own folder",
+                            (Verdict::Deny, _) => "blocked by the guard",
+                            _ => "waiting for your yes",
+                        };
                         self.guard_events.insert(
                             0,
                             GuardEvent {
@@ -1780,9 +1943,22 @@ impl App {
                                 who: name.clone(),
                                 cmd: detail.clone(),
                                 verdict,
-                                why: "seen only, enforcement comes next".into(),
+                                why: why.into(),
                             },
                         );
+                        if verdict == Verdict::Ask {
+                            self.ask(Question {
+                                from: name.clone(),
+                                task: "guard".into(),
+                                text: format!("Allow `{}`?", short(&detail, 80)),
+                                options: vec!["allow once".into(), "no".into()],
+                                chosen: None,
+                                guard_cmd: Some(detail.clone()),
+                                change: None,
+                                release: None,
+                                asked: Instant::now(),
+                            });
+                        }
                     }
                 }
             }
@@ -1845,6 +2021,8 @@ impl App {
                     stats::record(&def, &r);
                     self.after_run(i, &def, ok);
                 }
+                let goal = self.agents[i].goal.clone();
+                self.check_done(&def.name, &goal);
                 self.next_queued(i);
             }
             AgentEvent::Error(e) => {
@@ -1978,6 +2156,15 @@ fn add_lesson(cwd: &str, text: &str) {
             );
         }
         let _ = writeln!(f, "- {text} ({})", today());
+    }
+}
+
+/// "/home/me/dev/x" as "~/dev/x".
+pub fn tilde(path: &str) -> String {
+    let home = config::home().display().to_string();
+    match path.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        _ => path.to_string(),
     }
 }
 
@@ -2149,8 +2336,11 @@ mod tests {
         );
         app.agents[b].status = Status::Done;
         app.agents[k].status = Status::Done;
+        // a boss run that only hands out work does not end the task
         let def = app.agents[b].def.clone();
         app.after_run(b, &def, true);
+        assert_eq!(app.flow.as_ref().map(|f| f.0), Some(Stage::Building));
+        app.agent_event(b, AgentEvent::Text("FINISHED: config command works".into()));
         assert_eq!(app.flow.as_ref().map(|f| f.0), Some(Stage::Verifying));
         assert!(
             app.agents[k]
@@ -2162,5 +2352,98 @@ mod tests {
             app.agents[c].goal.contains("MAP.md"),
             "the map follows each finished task"
         );
+    }
+
+    #[test]
+    fn a_builder_commit_is_checked_then_merged() {
+        let dir = std::env::temp_dir().join(format!("orda-flow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        work::ensure_repo(&dir).unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        app.demo_mode = false;
+        app.cfg.notify.desktop = false;
+        app.cwd = dir.display().to_string();
+        app.holds.clear();
+        app.git = git::snapshot(&app.cwd);
+        app.seen = git::recent_all(&app.cwd).into_iter().map(|c| c.0).collect();
+        // everyone is busy, so work is queued instead of starting a real run
+        for a in app.agents.iter_mut() {
+            a.status = Status::Running;
+        }
+
+        let main = app.git.as_ref().unwrap().branch.clone();
+        let wt = work::prepare(&dir, "builder", work::Job::Task { main: &main }).unwrap();
+        std::fs::write(wt.join("app.py"), "print('hi')\n").unwrap();
+        let g = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        g(&["add", "."]);
+        g(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qm",
+            "add app",
+        ]);
+        let hash = String::from_utf8(g(&["rev-parse", "--short", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        app.watch_commits();
+        let (branch, pending) = app
+            .checks
+            .get(&hash)
+            .cloned()
+            .expect("the commit is being checked");
+        assert_eq!(branch, "wt/builder");
+        let mut want = vec!["tester", "ripple", "aegis", "referee", "reviewer"];
+        want.sort();
+        let mut got = pending.clone();
+        got.sort();
+        assert_eq!(
+            got, want,
+            "customs skips commits without a manifest, the builder does not check itself"
+        );
+
+        let boss = app.agent_index("boss").unwrap();
+        let goal = format!("New commit {hash} on wt/builder: \"add app\".");
+        for who in ["tester", "ripple", "aegis", "reviewer"] {
+            app.check_done(who, &goal);
+        }
+        assert!(
+            app.agents[boss].queue.is_empty(),
+            "no merge while the referee is still checking"
+        );
+        // the referee holds it; its run ends; still no merge
+        app.holds
+            .push((hash.clone(), "test bent".into(), "referee".into()));
+        app.check_done("referee", &goal);
+        assert!(app.agents[boss].queue.is_empty(), "no merge while held");
+        let r = app.agent_index("referee").unwrap();
+        app.agent_event(r, AgentEvent::Text(format!("RELEASE: {hash}")));
+        let task = app.agents[boss]
+            .queue
+            .back()
+            .expect("the boss is asked to merge");
+        assert!(task.contains("git merge --no-ff wt/builder") && task.contains(&hash));
+
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["worktree", "remove", "-f", &wt.display().to_string()])
+            .output();
+        let _ = std::fs::remove_dir_all(work::base(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

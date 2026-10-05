@@ -14,6 +14,7 @@ mod stats;
 mod theme;
 mod ui;
 mod vendors;
+mod work;
 
 use app::{App, Msg};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -32,6 +33,10 @@ async fn main() -> std::io::Result<()> {
     match arg.as_deref() {
         None | Some("--demo") => {}
         Some("config") => return config::write_default(),
+        Some("hook") => {
+            guard::hook();
+            return Ok(());
+        }
         Some(_) => {
             println!("{HELP}");
             return Ok(());

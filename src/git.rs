@@ -128,3 +128,25 @@ pub fn files(dir: &str, hash: &str) -> Vec<String> {
         .map(String::from)
         .collect()
 }
+
+/// Recent commits on every local branch, merges left out: what the team made.
+pub fn recent_all(dir: &str) -> Vec<(String, String)> {
+    git(
+        dir,
+        &[
+            "log",
+            "--branches",
+            "--no-merges",
+            "-n",
+            "60",
+            "--pretty=%h%x09%s",
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|l| {
+        l.split_once('\t')
+            .map(|(h, s)| (h.to_string(), s.to_string()))
+    })
+    .collect()
+}

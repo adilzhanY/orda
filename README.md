@@ -120,6 +120,19 @@ cd orda
 cargo install --path .
 ```
 
+## Try it
+
+```bash
+mkdir ~/dev/hello-orda && cd ~/dev/hello-orda
+orda
+```
+
+Press `i`, type a task, press enter. For example: `build a command line todo app in Python with add, list, done and remove, saved to a JSON file, with tests`.
+
+What happens: anchor writes the acceptance criteria into `SPEC.md`, the boss splits the work and hands out task cards, builders work in parallel on their own branches, every commit is checked by the tester, ripple, aegis, the referee and the reviewer, and the boss merges each branch once its checks pass. Questions for you arrive in the questions panel without stopping anyone. A folder that is not a git repo becomes one on the first task.
+
+This uses your real plans: every agent is a real Claude Code or Codex run.
+
 ## Use
 
 ```bash

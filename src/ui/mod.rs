@@ -149,8 +149,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let br = Style::new().fg(t.bright);
     let mut left = vec![
         Span::styled(" ORDA ", br.add_modifier(Modifier::BOLD)),
-        Span::styled(" project ", dim),
-        Span::styled(app.project.clone(), br),
+        Span::styled(" ", dim),
+        Span::styled(crate::app::tilde(&app.cwd), br),
     ];
     if let Some(g) = &app.git {
         left.push(Span::styled("  branch ", dim));

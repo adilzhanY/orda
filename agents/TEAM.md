@@ -27,6 +27,8 @@ Do not ask what you can find out yourself by reading the code, the docs, or the 
 
 **MSG.** A card to another agent; see "Messages to other agents" below.
 
+**FINISHED.** Only the boss writes `FINISHED: <one-line summary>`, once, when the owner's whole task is merged and done. It starts anchor's final check.
+
 **RECOMMEND.** Only the scout uses this line, to propose a model switch. Its format is in the scout's AGENT.md.
 
 **HOLD, RELEASE, LESSON.** Only ripple, aegis, the referee and customs use these, to stop a commit that broke something or opened a security hole from being merged, and to write down what the team should learn from it. See their AGENT.md files.
@@ -60,6 +62,7 @@ Kinds, and the fields each one must have:
 
 | kind | sent when | must have |
 |---|---|---|
+| `task` | the boss hands out work | title, done when (and the files, when known) |
 | `bug` | something does not work | title, repro, expected, actual, done when (and commit when you know it) |
 | `fixed` | you fixed what a card asked for | title, commit |
 | `review` | a change needs work before it can be merged | title, where, suggest |
@@ -106,9 +109,17 @@ orda's guard checks every shell command.
 - **Never** read or print secrets: tokens, keys, `.env` files, credential stores. Never put a real key, password, email address or other personal data into code, tests, fixtures or logs; use obvious placeholders. orda scans every new commit and holds it when it finds one.
 - Stay inside the project directory.
 
+## Where you work
+
+orda puts you in the right folder before your run starts; do not change it.
+
+- **Builders, the tester, and the agents that check commits** (ripple, aegis, the referee, customs, the reviewer) work in their own git worktree, outside the project, on a branch named after them (`wt/<your name>`). Builders get a branch that starts from the latest main, or still holds their unmerged work. Checkers get a branch set to exactly the commit they are checking.
+- **The boss and the doc keepers** (anchor, the curator, the scribe) work in the project itself, on its main branch.
+- Only the boss merges, and only into the main branch. Nobody switches branches, rebases or pushes.
+
 ## Git
 
-- Work in the worktree or branch the boss gave you.
+- Commit on the branch you are on (orda set it up).
 - Commit small, working steps. Message: one short line saying what changed. No body, no co-author lines, no tool names.
 - Never push, never rewrite shared history, never commit secrets or build output.
 

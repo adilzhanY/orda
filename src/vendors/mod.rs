@@ -75,6 +75,7 @@ pub fn spawn<M: Send + 'static>(
     def: &AgentDef,
     system: &str,
     prompt: &str,
+    dir: &std::path::Path,
     tx: UnboundedSender<M>,
     wrap: impl Fn(AgentEvent) -> M + Send + Sync + 'static,
 ) -> Option<tokio::task::AbortHandle> {
@@ -97,13 +98,27 @@ pub fn spawn<M: Send + 'static>(
             if !system.is_empty() {
                 c.args(["--append-system-prompt", system]);
             }
-            // every agent may search the web (TEAM.md asks them to)
-            c.args(["--allowedTools", "WebSearch,WebFetch"]);
+            // agents edit and run commands on their own; orda's guard checks every shell
+            // command through a PreToolUse hook, which works in every permission mode
+            c.args(["--permission-mode", "acceptEdits"]);
+            c.args([
+                "--allowedTools",
+                "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,TodoWrite",
+            ]);
+            c.args(["--settings", &hook_settings()]);
             c
         }
         "codex" => {
             let mut c = Command::new("codex");
             c.args(["exec", "--json", "--skip-git-repo-check", "-m", model]);
+            // writes stay inside the agent's folder; the network is on so builds can fetch
+            c.args([
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+            ]);
+            c.arg("-C").arg(dir);
             if !effort.is_empty() {
                 c.args(["-c", &format!("model_reasoning_effort={effort}")]);
             }
@@ -122,6 +137,7 @@ pub fn spawn<M: Send + 'static>(
             return None;
         }
     };
+    cmd.current_dir(dir);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -174,6 +190,17 @@ pub fn spawn<M: Send + 'static>(
         }
     });
     Some(task.abort_handle())
+}
+
+/// Claude Code settings that run `orda hook` before every shell command.
+fn hook_settings() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "orda".into());
+    serde_json::json!({
+        "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": exe, "args": ["hook"], "timeout": 10 } ] } ] }
+    })
+    .to_string()
 }
 
 /// True for the messages vendors print when a plan limit ran out.
@@ -306,6 +333,7 @@ mod live {
             &me,
             &system,
             "Do not use any tools. Reply with exactly one REPORT line, as your instructions describe, saying: pong",
+            std::path::Path::new("."),
             tx,
             |e| e,
         );
@@ -362,7 +390,7 @@ mod live_card {
         let task = "Do not use any tools. Pretend you just tested commit a3f9c21 on branch wt/builder and found this: \
                     `cargo test codex::unknown_item` panics at src/vendors/codex.rs:48 when codex sends a turn.diff event, \
                     where it should return AgentEvent::Unknown. Tell the right agent.";
-        super::spawn(&me, &system, task, tx, |e| e);
+        super::spawn(&me, &system, task, std::path::Path::new("."), tx, |e| e);
         let mut text = String::new();
         while let Some(e) = rx.recv().await {
             match e {
@@ -399,7 +427,7 @@ mod live_scout {
             "2026-10-05",
             crate::stats::summary()
         );
-        super::spawn(&me, &system, &task, tx, |e| e);
+        super::spawn(&me, &system, &task, std::path::Path::new("."), tx, |e| e);
         let mut searched = false;
         while let Some(e) = rx.recv().await {
             match &e {

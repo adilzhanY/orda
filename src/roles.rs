@@ -103,6 +103,8 @@ pub enum Line {
         reason: String,
     },
     Release(String),
+    /// boss: the owner's whole task is finished
+    Finished(String),
     /// bursar: a savings rule for a role, or "all"
     Save {
         scope: String,
@@ -266,6 +268,11 @@ pub fn protocol(line: &str) -> Option<Line> {
             commit: p.next()?,
             reason: p.next().unwrap_or_default(),
         });
+    }
+    if let Some(rest) = line.strip_prefix("FINISHED:") {
+        return Some(Line::Finished(
+            rest.trim().trim_matches(['*', '`']).trim().to_string(),
+        ));
     }
     if let Some(rest) = line.strip_prefix("SAVE:") {
         let mut p = split(rest).into_iter();
@@ -448,5 +455,9 @@ mod tests {
             })
         );
         assert_eq!(protocol("DROP: s3"), Some(Line::Drop("S3".into())));
+        assert_eq!(
+            protocol("FINISHED: todo app works"),
+            Some(Line::Finished("todo app works".into()))
+        );
     }
 }
