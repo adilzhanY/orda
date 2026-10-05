@@ -14,8 +14,9 @@ pub fn parse(v: &Value) -> Vec<AgentEvent> {
             let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
             vec![
                 AgentEvent::Context(n("input_tokens")),
+                // cached input costs little and is re-read every turn: it is not counted as spent
                 AgentEvent::Tokens {
-                    input: n("input_tokens"),
+                    input: n("input_tokens").saturating_sub(n("cached_input_tokens")),
                     output: n("output_tokens"),
                 },
                 AgentEvent::Done {
@@ -24,12 +25,21 @@ pub fn parse(v: &Value) -> Vec<AgentEvent> {
                 },
             ]
         }
-        "turn.failed" | "error" => {
+        // codex sends "error" for retries and again as "turn.failed" when it gives up: count it once
+        "error" => vec![],
+        "turn.failed" => {
             let msg = v["error"]["message"]
                 .as_str()
                 .or(v["message"].as_str())
                 .unwrap_or("codex failed");
-            if super::is_limit(msg) {
+            // the message is often JSON from the API; its inner message is the readable part
+            let inner = serde_json::from_str::<Value>(msg)
+                .ok()
+                .and_then(|j| j["error"]["message"].as_str().map(String::from));
+            let msg = inner.as_deref().unwrap_or(msg);
+            if super::model_unavailable(msg) {
+                vec![AgentEvent::ModelUnavailable(short(msg, 160))]
+            } else if super::is_limit(msg) {
                 vec![AgentEvent::LimitHit {
                     resets_at: super::try_again_at(msg, crate::app::now_unix()),
                     message: short(msg, 120),
@@ -72,6 +82,10 @@ pub fn parse(v: &Value) -> Vec<AgentEvent> {
             }
             "web_search" => vec![AgentEvent::WebSearch { query: query(item) }],
             "reasoning" | "todo_list" | "mcp_tool_call" => vec![],
+            "error" => vec![AgentEvent::Text(format!(
+                "codex: {}",
+                item["message"].as_str().unwrap_or("")
+            ))],
             other => vec![AgentEvent::Unknown(format!("codex item: {other}"))],
         },
         other => vec![AgentEvent::Unknown(format!("codex: {other}"))],
@@ -109,7 +123,7 @@ mod tests {
         );
         assert!(events.contains(&AgentEvent::Text("done".into())));
         assert!(events.contains(&AgentEvent::Tokens {
-            input: 39860,
+            input: 39860 - 31488,
             output: 68
         }));
         assert!(matches!(
@@ -137,6 +151,26 @@ mod tests {
                 }
             ),
             "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_model_the_plan_lacks_is_unavailable() {
+        // what codex really printed for gpt-6.1-sol on a ChatGPT Plus account
+        let line = r#"{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.\"}}"}}"#;
+        assert_eq!(
+            parse("codex", line),
+            vec![AgentEvent::ModelUnavailable(
+                "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."
+                    .into()
+            )]
+        );
+        assert!(
+            parse(
+                "codex",
+                r#"{"type":"error","message":"Reconnecting... 1/5"}"#
+            )
+            .is_empty()
         );
     }
 

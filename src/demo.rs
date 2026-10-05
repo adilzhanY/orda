@@ -277,6 +277,7 @@ impl Demo {
     pub fn seed(app: &mut App) -> Self {
         app.task = "build the first dashboard screen with live agent cards".into();
         app.burn = Some("-18%".into());
+        app.task_started = Some(Instant::now() - Duration::from_secs(41 * 60 + 7));
         app.plan = Some((5, 9));
         for a in app.agents.iter_mut() {
             match a.def.name.as_str() {
@@ -479,12 +480,14 @@ impl Demo {
                     files: 3,
                     added: 142,
                     removed: 18,
+                    ahead: 2,
                 },
                 Worktree {
                     name: "wt/builder-2".into(),
                     files: 2,
                     added: 96,
                     removed: 4,
+                    ahead: 1,
                 },
             ],
             commits: [
@@ -525,6 +528,7 @@ impl Demo {
                 hash: h.into(),
                 subject: s.into(),
                 when: w.into(),
+                on: "main".into(),
                 status: st.map(|(a, b)| (a.into(), b)),
             })
             .collect(),
@@ -797,11 +801,11 @@ impl Demo {
                     Question {
                         from: "scout".into(),
                         task: "models".into(),
-                        text: "Move tester from claude sonnet to codex gpt-6.1-sol? demo data: in orda, tester runs on sonnet failed 3 of 11".into(),
-                        options: vec!["switch to gpt-6.1-sol".into(), "keep it".into()],
+                        text: "Move tester from claude sonnet to codex gpt-6-sol? demo data: in orda, tester runs on sonnet failed 3 of 11".into(),
+                        options: vec!["switch to gpt-6-sol".into(), "keep it".into()],
                         chosen: None,
                         guard_cmd: None,
-                        change: Some(Change { agent: "tester".into(), vendor: "codex".into(), model: "gpt-6.1-sol".into() }),
+                        change: Some(Change { agent: "tester".into(), vendor: "codex".into(), model: "gpt-6-sol".into() }),
                         release: None,
                         asked: Instant::now(),
                     }

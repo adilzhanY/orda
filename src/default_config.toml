@@ -52,7 +52,7 @@ ask = ["git push*", "sudo *", "git reset --hard*", "rm -rf *"]
 # waits and resumes by itself.
 [fallback]
 codex = { vendor = "claude", model = "opus", effort = "high" }
-claude = { vendor = "codex", model = "gpt-6.1-sol", effort = "high" }
+claude = { vendor = "codex", model = "gpt-6-sol", effort = "high" }
 gemini = { vendor = "claude", model = "sonnet", effort = "medium" }
 
 # The team. role is a folder in orda's agents/ (boss, advisor, builder, designer,
@@ -81,7 +81,7 @@ job = "on call, never writes code"
 name = "builder"
 role = "builder"
 vendor = "codex"
-model = "gpt-6.1-sol"
+model = "gpt-6-sol"
 effort = "high"
 job = "implements tasks"
 
@@ -114,7 +114,7 @@ job = "web research for the others"
 name = "reviewer"
 role = "reviewer"
 vendor = "codex"
-model = "gpt-6.1-sol"
+model = "gpt-6-sol"
 effort = "high"
 job = "reviews every commit"
 always_on = true
@@ -131,7 +131,7 @@ job = "keeps the four docs current"
 name = "ripple"
 role = "ripple"
 vendor = "codex"
-model = "gpt-6.1-sol"
+model = "gpt-6-sol"
 effort = "high"
 job = "finds what a commit broke elsewhere"
 always_on = true

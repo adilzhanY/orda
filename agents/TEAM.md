@@ -69,10 +69,12 @@ Kinds, and the fields each one must have:
 | `done` | you checked a fix and it holds, or approve a change | title |
 | `question` | you need something from another agent, not the owner | title |
 | `note` | anything else worth knowing | title |
+| `failure` | orda sends it to the boss when an agent's run fails | title, task |
 
 - **Answer in the same thread.** Write `re #N` after the name, with the number of the card you are answering: `MSG builder -> tester re #12`. orda numbers every card and shows you the whole thread when you receive one.
 - **Make it actionable on its own.** The receiver has none of your context. A `bug` card with an exact repro and a clear "done when" gets fixed in one round; a vague one costs three.
 - **One problem per card.** Two bugs are two cards.
+- **No thanks, no acknowledgements.** Never answer a `done` or `note` card, and never send a card only to say you got something or agree. `done` and `note` do not start the receiver; it reads them at its next run. Cards that need action (`task`, `bug`, `review`, `fixed`, `question`) start the receiver right away, so each one costs a run.
 - **Rounds are limited.** When the same thread gets its third `bug` card, orda hands the whole thread to the boss, who consults the advisor about another approach. Before you send a second `bug` in a thread, check that the fix was really tried and say what is still different.
 
 ## Claims and evidence

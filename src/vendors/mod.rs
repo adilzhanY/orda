@@ -44,6 +44,8 @@ pub enum AgentEvent {
         ok: bool,
         cost_usd: Option<f64>,
     },
+    /// The vendor will not run this model for this account (not on the plan, unknown name).
+    ModelUnavailable(String),
     /// The vendor refused because a plan limit ran out. `resets_at` is unix seconds when known.
     LimitHit {
         resets_at: Option<i64>,
@@ -157,7 +159,13 @@ pub fn spawn<M: Send + 'static>(
         let mut done = false;
         while let Ok(Some(line)) = lines.next_line().await {
             for ev in parse(&vendor, &line) {
-                done |= matches!(ev, AgentEvent::Done { .. } | AgentEvent::LimitHit { .. });
+                done |= matches!(
+                    ev,
+                    AgentEvent::Done { .. }
+                        | AgentEvent::LimitHit { .. }
+                        | AgentEvent::ModelUnavailable(_)
+                        | AgentEvent::Error(_)
+                );
                 if !send(ev) {
                     return;
                 }
@@ -178,7 +186,9 @@ pub fn spawn<M: Send + 'static>(
                     .rev()
                     .find(|l| !l.trim().is_empty())
                     .unwrap_or("exited with an error");
-                send(if is_limit(last) {
+                send(if model_unavailable(last) {
+                    AgentEvent::ModelUnavailable(short(last, 160))
+                } else if is_limit(last) {
                     AgentEvent::LimitHit {
                         resets_at: try_again_at(last, now_unix()),
                         message: short(last, 120),
@@ -192,6 +202,58 @@ pub fn spawn<M: Send + 'static>(
     Some(task.abort_handle())
 }
 
+/// Run a model once with a one-word prompt: does this account have it at all?
+/// Blocking, up to two minutes.
+pub fn probe(vendor: &str, model: &str) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.arg("120");
+    match vendor {
+        "claude" => cmd.args([
+            "claude",
+            "-p",
+            "Reply with the word ok.",
+            "--model",
+            model,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]),
+        "codex" => cmd.args([
+            "codex",
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "-m",
+            model,
+            "Reply with the word ok.",
+        ]),
+        other => return Err(format!("orda cannot run {other} yet")),
+    };
+    let out = cmd
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // the vendor's own words, from its event stream
+    let why = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .flat_map(|l| parse(vendor, l))
+        .find_map(|e| match e {
+            AgentEvent::ModelUnavailable(m) | AgentEvent::Error(m) => Some(m),
+            AgentEvent::LimitHit { message, .. } => Some(message),
+            _ => None,
+        });
+    match why {
+        Some(m) => Err(m),
+        None if model_unavailable(&text) || !out.status.success() => Err(short(text.trim(), 160)),
+        None => Ok(()),
+    }
+}
+
 /// Claude Code settings that run `orda hook` before every shell command.
 fn hook_settings() -> String {
     let exe = std::env::current_exe()
@@ -201,6 +263,24 @@ fn hook_settings() -> String {
         "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": exe, "args": ["hook"], "timeout": 10 } ] } ] }
     })
     .to_string()
+}
+
+/// True for the messages vendors print when a model cannot be used with this account.
+pub fn model_unavailable(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    [
+        "model is not supported",
+        "not supported when using codex",
+        "model_not_found",
+        "model not found",
+        "unknown model",
+        "invalid model",
+        "issue with the selected model",
+        "may not exist or you may not have access",
+        "does not exist or you do not have access",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 
 /// True for the messages vendors print when a plan limit ran out.
@@ -450,5 +530,18 @@ mod live_scout {
             }
         }
         assert!(searched, "the scout never searched the web");
+    }
+}
+
+#[cfg(test)]
+mod live_probe {
+    /// `cargo test live_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_tells_models_apart() {
+        let bad = super::probe("codex", "gpt-6.1-sol");
+        println!("gpt-6.1-sol: {bad:?}");
+        assert!(bad.is_err_and(|e| e.contains("not supported")));
+        assert_eq!(super::probe("codex", "gpt-6-sol"), Ok(()));
     }
 }

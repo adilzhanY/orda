@@ -38,9 +38,20 @@ impl Flight {
     }
 }
 
+/// Cards that need the receiver to act start a run. `done` and `note` only inform:
+/// they wait for the receiver's next run, so two polite agents cannot thank each
+/// other forever.
+pub fn wakes(kind: &str) -> bool {
+    matches!(
+        kind,
+        "task" | "bug" | "review" | "question" | "escalation" | "fixed" | "failure"
+    )
+}
+
 pub fn color(t: &Theme, kind: &str) -> Color {
     match kind {
-        "bug" | "escalation" => t.bad,
+        "bug" | "escalation" | "failure" => t.bad,
+        "task" => t.claude,
         "fixed" | "done" => t.ok,
         "review" => t.codex,
         "question" => t.ask,

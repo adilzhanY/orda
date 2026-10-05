@@ -134,16 +134,49 @@ pub fn prepare(project: &Path, agent: &str, job: Job) -> Result<PathBuf, String>
     Ok(path)
 }
 
-/// The `wt/` branches that contain a commit, without the `wt/` prefix.
-pub fn owners(project: &Path, commit: &str) -> Vec<String> {
-    git(
+/// The branch a commit was made on: the one whose reflog says "commit" for it. Checkers'
+/// branches are reset to the commits they check, so "contains" alone would name them too.
+pub fn author(project: &Path, commit: &str) -> Option<String> {
+    let branches = git(
         project,
         &["branch", "--format=%(refname:short)", "--contains", commit],
     )
-    .unwrap_or_default()
-    .lines()
-    .filter_map(|b| b.trim().strip_prefix("wt/").map(String::from))
-    .collect()
+    .ok()?;
+    let branches: Vec<&str> = branches
+        .lines()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .collect();
+    for b in &branches {
+        let log = git(
+            project,
+            &[
+                "reflog",
+                "show",
+                "--format=%h %gs",
+                &format!("refs/heads/{b}"),
+            ],
+        )
+        .unwrap_or_default();
+        let made_here = log.lines().any(|l| {
+            let (h, what) = l.split_once(' ').unwrap_or(("", ""));
+            (h.starts_with(commit) || commit.starts_with(h))
+                && !h.is_empty()
+                && what.starts_with("commit")
+        });
+        if made_here {
+            return Some(b.to_string());
+        }
+    }
+    branches.first().map(|b| b.to_string())
+}
+
+/// The agent whose `wt/` branch a commit was made on.
+pub fn owners(project: &Path, commit: &str) -> Vec<String> {
+    author(project, commit)
+        .and_then(|b| b.strip_prefix("wt/").map(String::from))
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -193,9 +226,10 @@ mod tests {
             "the owner's checkout is untouched"
         );
 
-        // a checker gets that exact commit
+        // a checker gets that exact commit, and the commit still belongs to the builder
         let chk = prepare(&dir, "tester", Job::Check { commit: &c }).unwrap();
         assert_eq!(std::fs::read_to_string(chk.join("a.txt")).unwrap(), "one");
+        assert_eq!(owners(&dir, &c), ["builder"]);
 
         // unmerged work survives the next task
         let wt = prepare(&dir, "builder", Job::Task { main: &main }).unwrap();

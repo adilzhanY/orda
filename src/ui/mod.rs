@@ -179,12 +179,33 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         right.push(Span::styled(format!("{done}/{total} "), br));
         right.extend(bar(done as f64 / total as f64, 9, t.ok, t.line));
     }
-    let s = app.started.elapsed().as_secs();
-    right.push(Span::styled("  elapsed ", dim));
+    // the owner's task: what it is doing, and how long it has taken (the clock stops when it is done)
+    let (state, status) = app.task_state();
+    let color = match status {
+        crate::app::Status::Done => t.ok,
+        crate::app::Status::Running => t.claude,
+        crate::app::Status::Asking => t.ask,
+        crate::app::Status::Failed => t.bad,
+        _ => t.dim,
+    };
+    right.push(Span::styled("  ", dim));
     right.push(Span::styled(
-        format!("{:02}:{:02}:{:02} ", s / 3600, s / 60 % 60, s % 60),
-        br,
+        format!(" {state} "),
+        Style::new()
+            .fg(color)
+            .bg(t.badge)
+            .add_modifier(Modifier::BOLD),
     ));
+    if let Some(start) = app.task_started {
+        let end = app.task_done.unwrap_or_else(std::time::Instant::now);
+        let s = end.duration_since(start).as_secs();
+        right.push(Span::styled(
+            format!("  {:02}:{:02}:{:02} ", s / 3600, s / 60 % 60, s % 60),
+            br,
+        ));
+    } else {
+        right.push(Span::raw(" "));
+    }
     f.render_widget(Paragraph::new(lr(left, right, area.width)), area);
 }
 

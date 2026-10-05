@@ -282,3 +282,18 @@ While designing it, thinking like aegis found a real hole in orda: the guard did
 - Researcher and scribe moved from Gemini to Claude until a Gemini adapter exists; the reviewer is now always on, since merges wait for its check.
 
 **Rejected:** one shared checkout for everyone (parallel builders would overwrite each other), merging on a builder's word (the whole point of the checks), Claude's `bypassPermissions` (the hook and acceptEdits give the same autonomy with a real guard).
+
+## 26. What the first real run taught
+
+2026-10-06
+
+**Context:** the owner's first real task ("build a command line todo app in Python...") in `~/dev/hello-orda` ran 83 agent runs in ten minutes and produced tests but no app, with nothing merged.
+
+**Findings and fixes:**
+- **The Codex model did not exist for this account.** `gpt-6.1-sol` had been made the default after the scout recommended it from a blog post saying it was on the Plus plan; the API answers "not supported when using Codex with a ChatGPT account". Every Codex agent died at once. Defaults are back to `gpt-6-sol`. A model the vendor refuses now becomes `AgentEvent::ModelUnavailable`: that one model is blocked for the day (`codex:gpt-6-sol`, not the whole vendor) and the agent moves to its fallback with a handoff, like a used-up limit. An approved scout switch is applied only after `vendors::probe` gets an answer from the model.
+- **A failed run went unnoticed.** The builder that should have written the app died and nobody re-did its work. A failed run now sends the boss a `failure` card.
+- **Agents thanked each other forever.** Every `done` and `note` card started its receiver, which answered with another one: the referee and builder-2 exchanged about twenty. Only `task`, `bug`, `review`, `fixed`, `question`, `escalation` and `failure` cards start a run now (`mail::wakes`); `done` and `note` wait for the receiver's next run. TEAM.md forbids acknowledgement cards. The referee verifies a claim about a commit once.
+- **Nobody could tell whether it was finished.** The header now shows the task's state (working, waiting for you, waiting for a limit, idle, stalled, finished) and a task clock that stops when the task is done. orda wakes the boss after 20 seconds with nothing running and the task unfinished, at most 3 times without a new commit, then calls it stalled. The task is finished when anchor's final check finds nothing missing (or at the boss's `FINISHED:` without an anchor); a desktop notification says so.
+- **Tokens were overcounted** about tenfold by counting cache reads, which repeat every turn. Spent tokens now leave out cache reads (Claude) and cached input (Codex).
+- **The git panel hid the work.** It listed only the main branch's commits. It now lists every branch's commits with the branch each was made on (found in the branch reflogs, since checkers' branches contain the commits they check), and each worktree with how many commits it has left to merge.
+- **There was no log to read afterwards.** Every log line also goes to `~/.local/share/orda/logs/<project>.log`.

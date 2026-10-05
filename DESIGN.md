@@ -33,6 +33,10 @@ The approved concept is `.lavish/orda-dashboard.html` (2026-10-05). The terminal
 
 Iris has no accents by design, so under it vendors are told apart by the model name in each card title.
 
+## Header
+
+`ORDA`, the project path (`~/dev/x`), the branch, the task, and on the right the task's state as a chip (`working, 3 agents` in claude colour, `waiting for you, press q` in ask, `finished` in ok, `stalled` in bad, otherwise dim) followed by the task clock, which stops when the task is finished.
+
 ## Screen
 
 ```

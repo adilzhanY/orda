@@ -18,6 +18,8 @@ pub struct Worktree {
     pub files: u32,
     pub added: u32,
     pub removed: u32,
+    /// Commits on its branch that the main branch does not have yet.
+    pub ahead: u32,
 }
 
 #[derive(Clone)]
@@ -25,6 +27,8 @@ pub struct Commit {
     pub hash: String,
     pub subject: String,
     pub when: String,
+    /// The main branch when it is in main, otherwise the branch that holds it.
+    pub on: String,
     /// Set by orda for commits its agents made: "testing 14/20", "in review", ...
     pub status: Option<(String, Tone)>,
 }
@@ -54,19 +58,37 @@ pub fn snapshot(dir: &str) -> Option<Snapshot> {
     let ahead = git(dir, &["rev-list", "--count", "@{upstream}..HEAD"])
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    let commits = git(dir, &["log", "-n", "12", "--pretty=%h%x09%s%x09%cr"])
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let mut p = l.splitn(3, '\t');
-            Some(Commit {
-                hash: p.next()?.into(),
-                subject: p.next()?.into(),
-                when: p.next()?.replace(" ago", ""),
-                status: None,
-            })
+    // every branch: the team's work sits on wt/ branches until the boss merges it
+    let commits = git(
+        dir,
+        &[
+            "log",
+            "--branches",
+            "--no-merges",
+            "-n",
+            "12",
+            "--pretty=%h%x09%s%x09%cr",
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|l| {
+        let mut p = l.splitn(3, '\t');
+        let hash: String = p.next()?.into();
+        let on = if git(dir, &["merge-base", "--is-ancestor", &hash, "HEAD"]).is_some() {
+            branch.clone()
+        } else {
+            crate::work::author(std::path::Path::new(dir), &hash).unwrap_or_default()
+        };
+        Some(Commit {
+            hash,
+            subject: p.next()?.into(),
+            when: p.next()?.replace(" ago", ""),
+            on,
+            status: None,
         })
-        .collect();
+    })
+    .collect();
     let head_files = git(dir, &["show", "--numstat", "--format=", "HEAD"])
         .unwrap_or_default()
         .lines()
@@ -97,11 +119,15 @@ pub fn snapshot(dir: &str) -> Option<Snapshot> {
                 added += p.next().and_then(|n| n.parse().ok()).unwrap_or(0);
                 removed += p.next().and_then(|n| n.parse().ok()).unwrap_or(0);
             }
+            let ahead = git(dir, &["rev-list", "--count", &format!("HEAD..{name}")])
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0);
             Some(Worktree {
                 name,
                 files,
                 added,
                 removed,
+                ahead,
             })
         })
         .collect();

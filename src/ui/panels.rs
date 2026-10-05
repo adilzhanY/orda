@@ -197,9 +197,43 @@ pub fn git(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or(t.text);
         lines.push(Line::from(vec![
             Span::styled(wt.name.clone(), Style::new().fg(c)),
-            Span::styled(format!("  {} files ", wt.files), dim),
-            Span::styled(format!("+{}", wt.added), Style::new().fg(t.ok)),
-            Span::styled(format!(" -{}", wt.removed), Style::new().fg(t.bad)),
+            // what matters: work not merged yet, and work not even committed
+            Span::styled(
+                if wt.ahead > 0 {
+                    format!("  {} to merge", wt.ahead)
+                } else {
+                    "  merged".into()
+                },
+                if wt.ahead > 0 {
+                    Style::new().fg(t.ask)
+                } else {
+                    dim
+                },
+            ),
+            Span::styled(
+                if wt.files > 0 {
+                    format!("  {} files open ", wt.files)
+                } else {
+                    String::new()
+                },
+                dim,
+            ),
+            Span::styled(
+                if wt.files > 0 {
+                    format!("+{}", wt.added)
+                } else {
+                    String::new()
+                },
+                Style::new().fg(t.ok),
+            ),
+            Span::styled(
+                if wt.files > 0 {
+                    format!(" -{}", wt.removed)
+                } else {
+                    String::new()
+                },
+                Style::new().fg(t.bad),
+            ),
         ]));
     }
     lines.push(Line::from(Span::styled("commits", dim)));
@@ -208,9 +242,19 @@ pub fn git(f: &mut Frame, app: &App, area: Rect) {
             .holds
             .iter()
             .find(|h| h.0.starts_with(&c.hash) || c.hash.starts_with(&h.0));
+        let checking = app
+            .checks
+            .iter()
+            .find(|(h, _)| h.starts_with(&c.hash) || c.hash.starts_with(h.as_str()));
         let status = held
             .map(|h| (format!("held by {}", h.2), Tone::Bad))
-            .or(c.status.clone());
+            .or_else(|| {
+                checking.map(|(_, (_, p))| (format!("checking, {} left", p.len()), Tone::Busy))
+            })
+            .or(c.status.clone())
+            .or_else(|| {
+                (!c.on.is_empty() && c.on != g.branch).then(|| (format!("on {}", c.on), Tone::Info))
+            });
         let (label, color) = match &status {
             Some((s, tone)) => (
                 s.clone(),

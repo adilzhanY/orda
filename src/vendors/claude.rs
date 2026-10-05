@@ -32,6 +32,9 @@ pub fn parse(v: &Value) -> Vec<AgentEvent> {
             }
             out
         }
+        "result" if v["is_error"] == true && super::model_unavailable(s("result")) => {
+            vec![AgentEvent::ModelUnavailable(short(s("result"), 160))]
+        }
         "result"
             if v["is_error"] == true
                 && (v["api_error_status"] == 429 || super::is_limit(s("result"))) =>
@@ -45,10 +48,9 @@ pub fn parse(v: &Value) -> Vec<AgentEvent> {
             let u = &v["usage"];
             let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
             vec![
+                // cache reads cost little and repeat every turn: not counted as spent
                 AgentEvent::Tokens {
-                    input: n("input_tokens")
-                        + n("cache_creation_input_tokens")
-                        + n("cache_read_input_tokens"),
+                    input: n("input_tokens") + n("cache_creation_input_tokens"),
                     output: n("output_tokens"),
                 },
                 AgentEvent::Done {

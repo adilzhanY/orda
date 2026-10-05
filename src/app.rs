@@ -30,6 +30,13 @@ pub enum Msg {
         added: Vec<(&'static str, String)>,
         missing: Vec<(&'static str, String)>,
     },
+    /// A model tried once before an approved switch: Ok, or why it cannot run.
+    Probe {
+        agent: String,
+        vendor: String,
+        model: String,
+        result: Result<(), String>,
+    },
 }
 
 /// Where the owner's current task is: anchor writes criteria, the boss works, anchor checks.
@@ -89,6 +96,8 @@ pub struct Agent {
     return_pending: bool,
     /// Tokens spent on earlier vendors before a model switch: (vendor, tokens).
     carried: Vec<(String, u64)>,
+    /// `done` and `note` cards for it, read at the start of its next run.
+    mailbox: Vec<String>,
     /// Messages waiting for this agent's current run to end.
     inbox: VecDeque<u32>,
     /// When a message last landed here, and its kind, so the card can light up.
@@ -121,6 +130,7 @@ impl Agent {
             return_pending: false,
             carried: vec![],
             inbox: VecDeque::new(),
+            mailbox: vec![],
             flash: None,
         }
     }
@@ -329,6 +339,15 @@ pub struct App {
     /// Tokens per run this week against last week, "-12%".
     pub burn: Option<String>,
     jobs_started: bool,
+    /// Commits the referee has been asked to verify a claim about.
+    verified: std::collections::HashSet<String>,
+    /// When the owner's current task started and finished, and how often orda had to wake an idle boss.
+    pub task_started: Option<Instant>,
+    pub task_done: Option<Instant>,
+    nudges: u8,
+    quiet_since: Option<Instant>,
+    /// The first message id of anchor's final check, to see what it sent.
+    verify_from: u32,
     /// commit -> (its branch, agents still checking it); the boss is woken when it empties
     pub checks: HashMap<String, (String, Vec<String>)>,
     /// The owner's current task and how far it is.
@@ -343,6 +362,10 @@ pub struct App {
 }
 
 const SECOND: Duration = Duration::from_secs(1);
+/// How often orda wakes an idle boss before it calls the task stalled.
+const MAX_NUDGES: u8 = 3;
+/// How long nothing must run before orda wakes the boss.
+const QUIET: Duration = Duration::from_secs(20);
 const AUDIT_TASK: &str = "Run your weekly audit of the whole project.";
 /// How long a card stays lit after a message lands on it.
 pub const FLASH: Duration = Duration::from_millis(1600);
@@ -395,6 +418,12 @@ impl App {
             seen: Default::default(),
             flow: None,
             jobs_started: false,
+            verified: Default::default(),
+            task_started: None,
+            task_done: None,
+            nudges: 0,
+            quiet_since: None,
+            verify_from: 0,
             checks: HashMap::new(),
             messages: vec![],
             flights: vec![],
@@ -429,10 +458,14 @@ impl App {
     }
 
     pub fn note(&mut self, who: &str, text: impl Into<String>) {
+        let text = text.into();
+        if !self.demo_mode {
+            log_line(&self.cwd, who, &text);
+        }
         self.log.push_back(LogLine {
             at: clock(),
             who: who.into(),
-            text: text.into(),
+            text,
         });
         while self.log.len() > 200 {
             self.log.pop_front();
@@ -486,6 +519,24 @@ impl App {
                 added,
                 missing,
             } => self.deps_checked(&hash, &added, &missing),
+            Msg::Probe {
+                agent,
+                vendor,
+                model,
+                result,
+            } => match result {
+                Ok(()) => match config::set_model(&agent, &vendor, &model) {
+                    Ok(()) => self.note(
+                        "orda",
+                        format!("{model} answered: {agent} now runs on {vendor} {model}"),
+                    ),
+                    Err(e) => self.note("orda", format!("could not switch {agent}: {e}")),
+                },
+                Err(why) => self.note(
+                    "orda",
+                    format!("{agent} stays as it is: {model} does not run on this account ({why})"),
+                ),
+            },
             Msg::Agent(i, id, ev) => {
                 if self.agents.get(i).is_some_and(|a| a.run_id == id) {
                     self.agent_event(i, ev);
@@ -526,6 +577,7 @@ impl App {
             self.check_resets();
             if !self.demo_mode {
                 self.check_fresh();
+                self.check_idle();
             }
             dirty = true; // the elapsed clock moves every second
         }
@@ -784,6 +836,9 @@ impl App {
     fn submit(&mut self, task: String) {
         self.note("you", format!("task: {task}"));
         self.task = task.clone();
+        self.task_started = Some(Instant::now());
+        self.task_done = None;
+        self.nudges = 0;
         if !self.demo_mode {
             match work::ensure_repo(std::path::Path::new(&self.cwd)) {
                 Ok(true) => {
@@ -853,6 +908,12 @@ impl App {
                 task += &format!("- {c}, held by {who}: {why}\n");
             }
         }
+        if !self.agents[i].mailbox.is_empty() {
+            task += "\n\n## Cards for you since your last run (no answer needed)\n\n";
+            for m in self.agents[i].mailbox.drain(..) {
+                task += &format!("- {m}\n");
+            }
+        }
         // the boss is copied on every message between its team
         if self.agents[i].def.role == "boss" && !self.digest.is_empty() {
             task += "\n\n## Messages between your team since your last run\n\n";
@@ -913,7 +974,7 @@ impl App {
         a.status = Status::Running;
         a.now = "starting".into();
         if !a.goal.is_empty() {
-            a.task = short(&a.goal, 40);
+            a.task = task_label(&a.goal);
         }
         a.waiting = false;
         a.run_id += 1;
@@ -936,8 +997,13 @@ impl App {
         });
     }
 
-    fn is_blocked(&self, vendor: &str) -> bool {
-        self.blocked.get(vendor).is_some_and(|t| *t > now_unix())
+    /// A vendor out of limits, or one model the vendor refuses (`vendor:model`).
+    fn is_blocked(&self, key: &str) -> bool {
+        self.blocked.get(key).is_some_and(|t| *t > now_unix())
+    }
+
+    fn model_blocked(&self, f: &Fallback) -> bool {
+        self.is_blocked(&f.vendor) || self.is_blocked(&format!("{}:{}", f.vendor, f.model))
     }
 
     /// Put agent `i` on its own model, or on the first fallback whose limit is not used up.
@@ -953,7 +1019,7 @@ impl App {
             effort: own.effort.clone(),
         };
         let mut tried = vec![];
-        while self.is_blocked(&pick.vendor) {
+        while self.model_blocked(&pick) {
             tried.push(pick.vendor.clone());
             match self.cfg.fallback.get(&pick.vendor) {
                 Some(next) if !tried.contains(&next.vendor) => pick = next.clone(),
@@ -1015,7 +1081,169 @@ impl App {
             "  failed: 2 tests".into(),
         ];
         self.limit_hit(i, Some(resets_at), "You've hit your usage limit (demo)");
-        self.agents[i].now = "picking up where gpt-6.1-sol stopped".into();
+        self.agents[i].now = "picking up where gpt-6-sol stopped".into();
+    }
+
+    /// The vendor will not run this model for this account: take it off the list for the
+    /// day and hand the same task to the fallback, like a used-up limit.
+    fn model_unavailable(&mut self, i: usize, msg: &str) {
+        let (vendor, model, name) = {
+            let d = &self.agents[i].def;
+            (d.vendor.clone(), d.model.clone(), d.name.clone())
+        };
+        self.blocked
+            .insert(format!("{vendor}:{model}"), now_unix() + 12 * 3600);
+        self.note(
+            &name,
+            format!("{model} cannot run on this account: {}", short(msg, 90)),
+        );
+        let a = &mut self.agents[i];
+        if let Some(h) = a.handle.take() {
+            h.abort();
+        }
+        let prompt = handoff(
+            &a.goal,
+            &a.journal,
+            &format!("{model} ({vendor})"),
+            "the vendor refused the model",
+        );
+        self.launch(i, prompt);
+    }
+
+    /// Tell the boss an agent's run failed, so its work does not silently stop.
+    fn report_failure(&mut self, i: usize, err: &str) {
+        let a = &self.agents[i];
+        if self.demo_mode || a.def.role == "boss" || a.goal.is_empty() {
+            return;
+        }
+        let card = roles::Card {
+            to: "boss".into(),
+            re: None,
+            kind: "failure".into(),
+            fields: vec![
+                (
+                    "title".into(),
+                    format!("{} failed: {}", a.def.name, short(err, 120)),
+                ),
+                ("task".into(), short(&a.goal, 300)),
+                (
+                    "ask".into(),
+                    "hand this work to someone else, or try again".into(),
+                ),
+            ],
+        };
+        let from = a.def.name.clone();
+        if self.agent_index("boss").is_some() {
+            self.send(&from, card);
+        }
+    }
+
+    fn finish_task(&mut self) {
+        if self.task_done.is_none() {
+            self.task_done = Some(Instant::now());
+            let took = self
+                .task_started
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            self.note(
+                "orda",
+                format!("the task is finished, in {}m{:02}s", took / 60, took % 60),
+            );
+            if self.cfg.notify.desktop && !self.demo_mode {
+                let _ = std::process::Command::new("notify-send")
+                    .args(["-a", "orda", "orda: task finished", &self.task])
+                    .spawn();
+            }
+        }
+    }
+
+    /// What the owner's task is doing right now, for the header.
+    pub fn task_state(&self) -> (String, Status) {
+        if self.task.is_empty() {
+            return ("no task yet".into(), Status::Idle);
+        }
+        if self.task_done.is_some() {
+            return ("finished".into(), Status::Done);
+        }
+        let busy = self.agents.iter().filter(|a| a.status.busy()).count();
+        if busy > 0 {
+            return (
+                format!("working, {busy} agent{}", if busy == 1 { "" } else { "s" }),
+                Status::Running,
+            );
+        }
+        if !self.questions.is_empty() {
+            return ("waiting for you, press q".into(), Status::Asking);
+        }
+        if self.agents.iter().any(|a| a.waiting) {
+            return ("waiting for a limit to reset".into(), Status::Queued);
+        }
+        if self.nudges >= MAX_NUDGES {
+            return (
+                "stalled: the boss could not move it on".into(),
+                Status::Failed,
+            );
+        }
+        ("idle, waking the boss".into(), Status::Queued)
+    }
+
+    /// Nothing running, nothing queued, the task not finished: wake the boss, a few times at most.
+    fn check_idle(&mut self) {
+        if self.task.is_empty() || self.task_done.is_some() || self.nudges >= MAX_NUDGES {
+            return;
+        }
+        let quiet =
+            self.agents.iter().all(|a| {
+                !a.status.busy() && a.queue.is_empty() && a.inbox.is_empty() && !a.waiting
+            }) && self.flights.is_empty()
+                && self.questions.is_empty();
+        if !quiet {
+            self.quiet_since = None;
+            return;
+        }
+        // commits are noticed every 5 seconds and agents start right after each other:
+        // only a stretch of real quiet counts
+        let since = *self.quiet_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < QUIET {
+            return;
+        }
+        self.quiet_since = None;
+        let Some(b) = self.agents.iter().position(|a| a.def.role == "boss") else {
+            return;
+        };
+        self.nudges += 1;
+        self.note(
+            "orda",
+            format!(
+                "nothing is running and the task is not finished: woke the boss ({}/{MAX_NUDGES})",
+                self.nudges
+            ),
+        );
+        let pending: Vec<String> = self
+            .checks
+            .iter()
+            .map(|(h, (b, p))| format!("{h} on {b}: still checking {}", p.join(", ")))
+            .collect();
+        let holds: Vec<String> = self
+            .holds
+            .iter()
+            .map(|(h, why, who)| format!("{h} held by {who}: {why}"))
+            .collect();
+        let task = format!(
+            "Nothing is running and the owner's task is not finished.\n\nThe task:\n{}\n\nCommits still being checked: {}\nHeld commits: {}\n\nLook at the branches (`git log --oneline --all`), decide what is next, and act: hand out work with task cards, merge what passed, or write FINISHED: if everything is merged and done.",
+            self.task,
+            if pending.is_empty() {
+                "none".into()
+            } else {
+                pending.join("; ")
+            },
+            if holds.is_empty() {
+                "none".into()
+            } else {
+                holds.join("; ")
+            },
+        );
+        self.start(b, &task);
     }
 
     /// A vendor refused for limits: block it, then hand the same task to the next model.
@@ -1133,41 +1361,45 @@ impl App {
             start: Instant::now(),
             msg: id,
         });
-        // every claim goes to the referee too
+        // a claim about a commit goes to the referee, once per commit
+        let claimed = self
+            .messages
+            .last()
+            .map(|m| {
+                m.card
+                    .get("commit")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
         let referee = self.agents.iter().position(|a| a.def.role == "referee");
         if let Some(r) = referee
             && matches!(kind.as_str(), "fixed" | "done")
             && from != "referee"
             && self.agents[r].def.name != to
+            && !claimed.is_empty()
             && !self.demo_mode
         {
-            let msgs: Vec<&mail::Message> = self
-                .messages
-                .iter()
-                .filter(|m| m.thread == thread)
-                .collect();
-            // with the commit named, orda sets the referee's folder to it
-            let claimed = msgs
-                .last()
-                .map(|m| {
-                    m.card
-                        .get("commit")
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .to_string()
-                })
-                .unwrap_or_default();
-            let head = if claimed.is_empty() {
-                String::new()
-            } else {
-                format!("New commit {claimed} (claimed in #{id}). ")
-            };
-            let task = format!(
-                "{head}Verify this claim before anyone relies on it.\n\n{}",
-                mail::prompt(&msgs, "referee")
-            );
-            self.queue_task(r, task);
+            let name = self.agents[r].def.name.clone();
+            let already = !self.verified.insert(claimed.clone())
+                || self.checks.iter().any(|(h, (_, p))| {
+                    (h.starts_with(&claimed) || claimed.starts_with(h.as_str()))
+                        && p.contains(&name)
+                });
+            if !already {
+                let msgs: Vec<&mail::Message> = self
+                    .messages
+                    .iter()
+                    .filter(|m| m.thread == thread)
+                    .collect();
+                let task = format!(
+                    "New commit {claimed} (claimed in #{id}). Verify this claim before anyone relies on it.\n\n{}",
+                    mail::prompt(&msgs, "referee")
+                );
+                self.queue_task(r, task);
+            }
         }
         // the same bug a third time: the pair is stuck, the boss and the advisor take a look
         let rounds = self
@@ -1233,6 +1465,19 @@ impl App {
         if self.demo_mode {
             return;
         }
+        if !mail::wakes(&kind) {
+            let title = self
+                .messages
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.card.get("title").to_string())
+                .unwrap_or_default();
+            self.agents[i]
+                .mailbox
+                .push(format!("#{id} from {from} ({kind}): {title}"));
+            return;
+        }
+        let a = &mut self.agents[i];
         if a.status.busy() {
             a.inbox.push_back(id);
         } else {
@@ -1381,7 +1626,20 @@ impl App {
                         self.start(b, &format!("{task}\n\n## Acceptance criteria from anchor (also in SPEC.md)\n\n{criteria}"));
                     }
                 }
-                Some((Stage::Verifying, _)) => self.flow = None,
+                Some((Stage::Verifying, task)) => {
+                    // a bug card from anchor means criteria are missing: the boss is on it
+                    let missing = self.messages.iter().any(|m| {
+                        m.id >= self.verify_from
+                            && m.from == self.agents[i].def.name
+                            && m.card.kind == "bug"
+                    });
+                    if missing {
+                        self.flow = Some((Stage::Building, task));
+                    } else {
+                        self.flow = None;
+                        self.finish_task();
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -1421,6 +1679,7 @@ impl App {
             .collect();
         for (hash, subject) in fresh {
             self.seen.insert(hash.clone());
+            self.nudges = 0;
             let diff = git::show(&self.cwd, &hash);
             let files = git::files(&self.cwd, &hash);
             let found = secrets::scan_diff(&diff);
@@ -1717,8 +1976,28 @@ impl App {
                 a.def.vendor = c.vendor.clone();
                 a.def.model = c.model.clone();
             }
-        } else if let Err(e) = config::set_model(&c.agent, &c.vendor, &c.model) {
-            self.note("orda", format!("could not switch {}: {e}", c.agent));
+        } else {
+            // a recommendation is only as good as the model actually running here: try it first
+            let (agent, vendor, model, tx) = (
+                c.agent.clone(),
+                c.vendor.clone(),
+                c.model.clone(),
+                self.tx.clone(),
+            );
+            self.note(
+                "orda",
+                format!("trying {model} once before switching {agent}"),
+            );
+            tokio::task::spawn_blocking(move || {
+                let result = vendors::probe(&vendor, &model);
+                let _ = tx.send(Msg::Probe {
+                    agent,
+                    vendor,
+                    model,
+                    result,
+                });
+            });
+            return format!("{} to {} {}, if it runs here", c.agent, c.vendor, c.model);
         }
         self.note(
             "orda",
@@ -1814,10 +2093,14 @@ impl App {
             }
             roles::Line::Finished(summary) => {
                 self.note(who, format!("finished the task: {summary}"));
+                if self.agent_index("anchor").is_none() || self.flow.is_none() {
+                    self.finish_task();
+                }
                 if let Some((Stage::Building, task)) = self.flow.clone()
                     && let Some(k) = self.agents.iter().position(|a| a.def.role == "anchor")
                 {
                     self.flow = Some((Stage::Verifying, task.clone()));
+                    self.verify_from = self.messages.last().map_or(1, |m| m.id + 1);
                     self.note("anchor", "checking every criterion has evidence");
                     self.queue_task(k, format!("The boss reports this task finished. Check every acceptance criterion of it in SPEC.md has evidence.\n\nThe task:\n{task}\n\nThe boss's summary:\n{summary}"));
                 }
@@ -2033,8 +2316,10 @@ impl App {
                 a.now = "failed".into();
                 a.say(e.clone());
                 self.note(&name, format!("error: {e}"));
+                self.report_failure(i, &e);
                 self.next_queued(i);
             }
+            AgentEvent::ModelUnavailable(msg) => self.model_unavailable(i, &msg),
             AgentEvent::LimitHit { resets_at, message } => self.limit_hit(i, resets_at, &message),
             AgentEvent::Unknown(e) => self.note(&name, format!("unknown event: {e}")),
         }
@@ -2168,6 +2453,34 @@ pub fn tilde(path: &str) -> String {
     }
 }
 
+/// Every log line also goes to ~/.local/share/orda/logs/<project>.log, to read after a session.
+fn log_line(cwd: &str, who: &str, text: &str) {
+    let name = cwd.rsplit('/').next().unwrap_or("orda");
+    let dir = stats::dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(format!("{name}.log")))
+    {
+        let _ = writeln!(f, "{} {} {who:<11} {text}", today(), clock());
+    }
+}
+
+/// A short footer for an agent's card: what this run is about.
+fn task_label(goal: &str) -> String {
+    if let Some(rest) = goal.strip_prefix("New commit ") {
+        return format!("checking {}", rest.split_whitespace().next().unwrap_or(""));
+    }
+    if let Some(rest) = goal.strip_prefix("You have a message from ") {
+        // "boss (#50). The whole conversation..."
+        let from = rest.split_whitespace().next().unwrap_or("");
+        let id = rest.split(['(', ')']).nth(1).unwrap_or("");
+        return format!("{id} from {from}");
+    }
+    short(goal.lines().next().unwrap_or(goal), 40)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2188,17 +2501,17 @@ mod tests {
             (a.def.vendor.as_str(), a.def.model.as_str()),
             ("claude", "opus")
         );
-        assert_eq!(a.primary.as_ref().unwrap().model, "gpt-6.1-sol");
+        assert_eq!(a.primary.as_ref().unwrap().model, "gpt-6-sol");
         assert_eq!(a.status, Status::Running);
         assert!(
             app.log
                 .iter()
-                .any(|l| { l.text == "switched gpt-6.1-sol -> opus (claude)" })
+                .any(|l| { l.text == "switched gpt-6-sol -> opus (claude)" })
         );
         let h = handoff(
             &a.goal,
             &a.journal,
-            "gpt-6.1-sol (codex)",
+            "gpt-6-sol (codex)",
             "its plan limit ran out",
         );
         assert!(
@@ -2220,7 +2533,7 @@ mod tests {
         let a = &app.agents[i];
         assert_eq!(
             (a.def.vendor.as_str(), a.def.model.as_str()),
-            ("codex", "gpt-6.1-sol")
+            ("codex", "gpt-6-sol")
         );
         assert!(a.primary.is_none() && !a.waiting);
         assert_eq!(a.status, Status::Running);
@@ -2245,11 +2558,11 @@ mod tests {
                 cost_usd: None,
             },
         );
-        assert_eq!(app.agents[i].def.model, "gpt-6.1-sol");
+        assert_eq!(app.agents[i].def.model, "gpt-6-sol");
         assert!(
             app.log
                 .iter()
-                .any(|l| l.text == "back on gpt-6.1-sol, switched from opus")
+                .any(|l| l.text == "back on gpt-6-sol, switched from opus")
         );
     }
 
@@ -2445,5 +2758,151 @@ mod tests {
             .output();
         let _ = std::fs::remove_dir_all(work::base(&dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn real_app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        app.demo_mode = false;
+        app.cfg.notify.desktop = false;
+        app.holds.clear();
+        app.messages.clear();
+        app.task.clear();
+        for a in app.agents.iter_mut() {
+            a.status = Status::Idle;
+            a.queue.clear();
+        }
+        app
+    }
+
+    fn card(to: &str, kind: &str, commit: &str) -> roles::Card {
+        let mut fields = vec![("title".to_string(), "t".to_string())];
+        if !commit.is_empty() {
+            fields.push(("commit".into(), commit.into()));
+        }
+        roles::Card {
+            to: to.into(),
+            re: None,
+            kind: kind.into(),
+            fields,
+        }
+    }
+
+    #[test]
+    fn thanks_do_not_start_runs() {
+        // the hello-orda run: referee and builder-2 woke each other with done and note cards ~20 times
+        let mut app = real_app();
+        let r = app.agent_index("referee").unwrap();
+        for kind in ["done", "note"] {
+            let id = app.send("builder-2", card("referee", kind, "")).unwrap();
+            app.deliver(id);
+        }
+        assert_eq!(app.agents[r].status, Status::Idle, "no run started");
+        assert!(app.agents[r].inbox.is_empty());
+        assert_eq!(
+            app.agents[r].mailbox.len(),
+            2,
+            "read at its next run instead"
+        );
+    }
+
+    #[test]
+    fn the_referee_verifies_a_commit_once() {
+        let mut app = real_app();
+        let r = app.agent_index("referee").unwrap();
+        app.agents[r].status = Status::Running; // queue instead of starting a real run
+        app.send("builder-2", card("boss", "done", "c82501b"));
+        app.send("builder-2", card("tester", "done", "c82501b"));
+        app.send("builder-2", card("boss", "fixed", "c82501b"));
+        app.send("builder-2", card("boss", "done", ""));
+        assert_eq!(app.agents[r].queue.len(), 1);
+        assert!(app.agents[r].queue[0].starts_with("New commit c82501b"));
+    }
+
+    #[test]
+    fn a_refused_model_moves_to_the_fallback() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        let b = app.agent_index("builder").unwrap();
+        app.agent_event(
+            b,
+            AgentEvent::ModelUnavailable("The 'gpt-6-sol' model is not supported".into()),
+        );
+        let a = &app.agents[b];
+        assert_eq!(
+            (a.def.vendor.as_str(), a.def.model.as_str()),
+            ("claude", "opus")
+        );
+        assert!(app.blocked.contains_key("codex:gpt-6-sol"));
+        assert!(
+            !app.blocked.contains_key("codex"),
+            "other codex models stay usable"
+        );
+    }
+
+    #[test]
+    fn a_failure_reaches_the_boss() {
+        let mut app = real_app();
+        let b = app.agent_index("builder").unwrap();
+        app.agents[b].goal = "write todo.py".into();
+        app.agents[b].status = Status::Running;
+        app.agent_event(b, AgentEvent::Error("exited with an error".into()));
+        let m = app.messages.last().expect("a card went out");
+        assert_eq!(
+            (m.from.as_str(), m.to.as_str(), m.card.kind.as_str()),
+            ("builder", "boss", "failure")
+        );
+        assert!(mail::wakes("failure"));
+    }
+
+    #[test]
+    fn the_header_says_where_the_task_is() {
+        let mut app = real_app();
+        assert_eq!(app.task_state().0, "no task yet");
+        app.task = "build x".into();
+        app.agents[0].status = Status::Running;
+        assert_eq!(app.task_state().0, "working, 1 agent");
+        app.agents[0].status = Status::Done;
+        app.task_done = Some(Instant::now());
+        assert_eq!(app.task_state().0, "finished");
+    }
+
+    #[test]
+    fn card_footers_are_short() {
+        assert_eq!(
+            task_label("New commit 8151b27 on wt/builder-2: \"x\"."),
+            "checking 8151b27"
+        );
+        assert_eq!(
+            task_label("You have a message from boss (#50). The whole conversation so far"),
+            "#50 from boss"
+        );
+        assert_eq!(
+            task_label("Write the acceptance criteria\nfor this"),
+            "Write the acceptance criteria"
+        );
+    }
+
+    /// Look at a real project without running anything: `ORDA_DIR=~/dev/x cargo test peek -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn peek() {
+        let Ok(dir) = std::env::var("ORDA_DIR") else {
+            return;
+        };
+        let mut app = real_app();
+        app.cwd = dir;
+        app.git = git::snapshot(&app.cwd);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(196, 54)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        for y in 0..20 {
+            println!(
+                "{}",
+                (100..196)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            );
+        }
     }
 }
