@@ -1,7 +1,7 @@
 //! `orda --demo`: a scripted team so the dashboard can be seen and tuned
 //! without spending tokens. Nothing here talks to a real agent.
 
-use crate::app::{Agent, App, GuardEvent, Question, Remembered, Scope, Status, Web};
+use crate::app::{Agent, App, Change, GuardEvent, Question, Remembered, Scope, Status, Web};
 use crate::git::{Commit, Snapshot, Tone, Worktree};
 use crate::guard::Verdict;
 use std::time::{Duration, Instant};
@@ -15,6 +15,16 @@ pub struct Demo {
     log_i: usize,
     web_i: usize,
     out_i: usize,
+    /// 0: nothing yet, 1: builder hit its codex limit, 2: the limit reset, 3: back on codex
+    limit_act: u8,
+    last_frame: usize,
+    /// Index into MAIL, and the start of the current pass through it.
+    mail_i: usize,
+    mail_from: Duration,
+    threads: [Option<u32>; 9],
+    scanned: bool,
+    /// How many of the free-check and refresh scenes have played this pass.
+    free_i: u8,
 }
 
 const LOG: &[(&str, &str)] = &[
@@ -69,6 +79,179 @@ const WEB: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// (second, sender, conversation, card). `{re}` becomes ` re #<first id>` of that conversation.
+/// The script repeats every 140 seconds.
+const MAIL: &[(u64, &str, usize, &str)] = &[
+    (
+        8,
+        "tester",
+        0,
+        "MSG tester -> builder\nkind: bug\nseverity: high\ncommit: a3f9c21\ntitle: turn.diff event crashes the codex adapter\nrepro: cargo test codex::unknown_item\nexpected: AgentEvent::Unknown, the run keeps going\nactual: panic at src/vendors/codex.rs:48\ndone when: the test passes and a live run survives turn.diff\nEND",
+    ),
+    (
+        15,
+        "builder",
+        0,
+        "MSG builder -> tester{re}\nkind: fixed\ntitle: unknown codex items become AgentEvent::Unknown\ncommit: b71c0e2\nEND",
+    ),
+    (
+        22,
+        "tester",
+        0,
+        "MSG tester -> builder{re}\nkind: bug\nseverity: high\ntitle: item.updated still panics\nrepro: cargo test codex::item_updated\nexpected: no panic\nactual: panic at src/vendors/codex.rs:61\ndone when: both tests pass\nEND",
+    ),
+    (
+        29,
+        "builder",
+        0,
+        "MSG builder -> tester{re}\nkind: fixed\ntitle: item.updated handled the same way\ncommit: c40d9aa\nEND",
+    ),
+    (
+        36,
+        "tester",
+        0,
+        "MSG tester -> builder{re}\nkind: done\ntitle: verified, 22 of 22 passing\nEND",
+    ),
+    (
+        40,
+        "ripple",
+        3,
+        "HOLD: 9e1b0d4 | lr() now pads one column too far\nMSG ripple -> builder-2\nkind: bug\nseverity: high\ncommit: 9e1b0d4\ntitle: the card commit shifts the git and log panels by one column\nrepro: cargo test ripple_lr_width (passes on 9e1b0d4^, fails on 9e1b0d4)\nexpected: lr() returns exactly the width it is given\nactual: one column wider, every panel that calls lr() wraps its last column\ndone when: ripple_lr_width passes and every panel renders as on the parent\nEND\nMSG ripple -> tester\nkind: note\ntitle: 11 places call lr() and none had a width test; ripple_lr_width covers it now\nEND",
+    ),
+    (
+        44,
+        "reviewer",
+        1,
+        "MSG reviewer -> builder-2\nkind: review\ntitle: the card redraws every tick even when idle\nwhere: src/ui/card.rs:88\nsuggest: draw only when the agent changed\nEND",
+    ),
+    (
+        49,
+        "builder-2",
+        3,
+        "MSG builder-2 -> ripple{re}\nkind: fixed\ntitle: lr() fills to the width, not past it\ncommit: 3c81f0e\nEND",
+    ),
+    (
+        51,
+        "builder-2",
+        1,
+        "MSG builder-2 -> reviewer{re}\nkind: fixed\ntitle: redraw only on change\ncommit: 5e2f1b7\nEND",
+    ),
+    (
+        55,
+        "ripple",
+        3,
+        "RELEASE: 9e1b0d4\nMSG ripple -> builder-2{re}\nkind: done\ntitle: fix holds, every panel matches the parent\nEND\nLESSON: when you change a helper in ui/mod.rs, render every panel that calls it before you commit",
+    ),
+    (
+        57,
+        "reviewer",
+        1,
+        "MSG reviewer -> builder-2{re}\nkind: done\ntitle: approved\nEND",
+    ),
+    (
+        60,
+        "aegis",
+        4,
+        "HOLD: 4b08aa3 | the guard misses commands hidden in bash -c and eval\nMSG aegis -> builder\nkind: bug\nseverity: critical\ncommit: 4b08aa3\ntitle: deny rules can be walked around with bash -c, eval or $( )\nrepro: cargo test guard::tests::verdicts with bash -c \"rm -rf /\"\nexpected: Deny\nactual: Allow, the command runs\ndone when: commands inside quotes, $( ) and after sudo, env, eval, nohup or xargs are checked too\nEND",
+    ),
+    (
+        67,
+        "builder",
+        4,
+        "MSG builder -> aegis{re}\nkind: fixed\ntitle: the guard looks inside quotes, $( ) and wrappers\ncommit: 8f2d6a1\nEND",
+    ),
+    (
+        72,
+        "aegis",
+        4,
+        "RELEASE: 4b08aa3\nMSG aegis -> builder{re}\nkind: done\ntitle: the bypasses are blocked, the proof test passes\nEND\nLESSON: a deny list must also check commands inside quotes, $( ) and after wrappers like sudo, env and eval",
+    ),
+    (
+        84,
+        "bursar",
+        5,
+        "SAVE: all | Search with grep and open only the lines around the matches; read a whole file only when you will change most of it\nMSG bursar -> scout\nkind: note\ntitle: the tester spends 3.1 times the builder's tokens per run for the same success rate\nask: worth checking whether sonnet at low effort holds the tester's success rate\nEND\nREPORT: tokens per run down 18% this week; biggest cost is the tester rereading full test logs",
+    ),
+    (
+        64,
+        "tester",
+        2,
+        "MSG tester -> builder-2\nkind: bug\nseverity: medium\ntitle: spinner keeps turning after done\nrepro: orda --demo, wait for a run to finish\nexpected: the spinner stops\nactual: it keeps turning\ndone when: no spinner on a finished card\nEND",
+    ),
+    (
+        70,
+        "builder-2",
+        2,
+        "MSG builder-2 -> tester{re}\nkind: fixed\ntitle: spinner only while busy\ncommit: 91aa3c0\nEND",
+    ),
+    (
+        76,
+        "tester",
+        2,
+        "MSG tester -> builder-2{re}\nkind: bug\nseverity: medium\ntitle: still turns on the scout card\nrepro: press s in demo mode\nexpected: no spinner\nactual: spinner\ndone when: no spinner on any idle card\nEND",
+    ),
+    (
+        82,
+        "builder-2",
+        2,
+        "MSG builder-2 -> tester{re}\nkind: fixed\ntitle: idle cards never spin\ncommit: 0d7e2b4\nEND",
+    ),
+    (
+        88,
+        "tester",
+        2,
+        "MSG tester -> builder-2{re}\nkind: bug\nseverity: medium\ntitle: turns again after a fallback switch\nrepro: wait for the limit switch in demo\nexpected: no spinner\nactual: spinner after the switch\ndone when: no spinner after a switch\nEND",
+    ),
+    (
+        96,
+        "anchor",
+        6,
+        "MSG anchor -> boss\nkind: bug\nseverity: medium\ntitle: criteria 4 and 7 of task 5 have no evidence\nrepro: SPEC.md, task 5\nexpected: a test or an output for every criterion\nactual: 4, no test checks the fallback card title; 7, no check of the tabs below 170 columns\ndone when: both have a test that passes\nEND",
+    ),
+    (
+        103,
+        "referee",
+        7,
+        "HOLD: 5e2f1b7 | a test was loosened to pass\nMSG referee -> builder-2\nkind: bug\nseverity: high\ncommit: 5e2f1b7\ntitle: the card width test was loosened instead of fixing the code\nrepro: git show 5e2f1b7 -- src/ui/team.rs, then cargo test card_width\nexpected: the test still checks the exact width, assert_eq!(w, 40)\nactual: it became assert!(w > 0) and passes for any width\ndone when: the exact assert is back and passes\nEND\nLESSON: never loosen an assert to make a test pass; fix the code, or say why the old value was wrong",
+    ),
+    (
+        109,
+        "customs",
+        8,
+        "MSG customs -> builder\nkind: bug\nseverity: high\ncommit: 3c81f0e\ntitle: ratatui-flexbox does not exist on crates.io\nrepro: curl https://crates.io/api/v1/crates/ratatui-flexbox gives 404\nexpected: a real crate, or none\nactual: an invented name; ratatui already has Flex in ratatui::layout\ndone when: the dependency is gone and Layout::flex does the job\nEND",
+    ),
+    (
+        110,
+        "builder-2",
+        7,
+        "MSG builder-2 -> referee{re}\nkind: fixed\ntitle: the exact width is back and the card is 40 wide again\ncommit: 77d0a2c\nEND",
+    ),
+    (
+        114,
+        "builder",
+        8,
+        "MSG builder -> customs{re}\nkind: fixed\ntitle: ratatui-flexbox removed, Layout::flex used\ncommit: b4e9c11\nEND",
+    ),
+    (
+        116,
+        "referee",
+        7,
+        "RELEASE: 5e2f1b7\nMSG referee -> builder-2{re}\nkind: done\ntitle: ran cargo test card_width on a clean checkout, passes with the exact assert\nEND",
+    ),
+    (
+        119,
+        "customs",
+        8,
+        "RELEASE: 3c81f0e\nMSG customs -> builder{re}\nkind: done\ntitle: no invented packages left, every call exists in ratatui 0.30\nEND\nLESSON: look a package up on its registry before adding it; check the library you already have first",
+    ),
+    (
+        126,
+        "curator",
+        6,
+        "REPORT: MAP.md updated to b4e9c11: the new Flex layout and where the integrity check lives",
+    ),
+];
+
 const OUTPUT: &[(&str, &str)] = &[
     ("builder", "parsing item.completed into AgentEvent::Text"),
     ("builder-2", "drawing the title into the top border"),
@@ -93,6 +276,7 @@ fn set(a: &mut Agent, status: Status, now: &str, task: &str, tokens: u64, lines:
 impl Demo {
     pub fn seed(app: &mut App) -> Self {
         app.task = "build the first dashboard screen with live agent cards".into();
+        app.burn = Some("-18%".into());
         app.plan = Some((5, 9));
         for a in app.agents.iter_mut() {
             match a.def.name.as_str() {
@@ -157,6 +341,70 @@ impl Demo {
                     "2 reviews today",
                     12_000,
                     &["9e1b0d4 approved with 1 note"],
+                ),
+                "ripple" => set(
+                    a,
+                    Status::Running,
+                    "reach of 9e1b0d4: lr() has 11 callers",
+                    "always on",
+                    14_200,
+                    &["3 leaf commits checked today, all clean"],
+                ),
+                "aegis" => set(
+                    a,
+                    Status::Running,
+                    "reviewing guard.rs: input from agents",
+                    "always on",
+                    21_800,
+                    &["2 commits today, nothing sensitive"],
+                ),
+                "bursar" => set(
+                    a,
+                    Status::Idle,
+                    "next review with the scout in 1 day",
+                    "rules: 4 active, 1 rolled back",
+                    5_100,
+                    &["last: S4 cut tester tokens 22%, success held"],
+                ),
+                "referee" => set(
+                    a,
+                    Status::Running,
+                    "verifying #2: builder's fixed claim",
+                    "always on",
+                    9_800,
+                    &["claims checked today: 6, one bounced"],
+                ),
+                "customs" => set(
+                    a,
+                    Status::Idle,
+                    "no manifest changes since 23:10",
+                    "",
+                    2_400,
+                    &[],
+                ),
+                "anchor" => set(
+                    a,
+                    Status::Idle,
+                    "task 5: 7 of 9 criteria have evidence",
+                    "",
+                    4_700,
+                    &[],
+                ),
+                "curator" => set(
+                    a,
+                    Status::Idle,
+                    "MAP.md up to date at a3f9c21",
+                    "",
+                    1_200,
+                    &[],
+                ),
+                "scout" => set(
+                    a,
+                    Status::Idle,
+                    "last scan 2 days ago",
+                    "next scan in 1 day",
+                    6_400,
+                    &["last scan: nothing worth switching"],
                 ),
                 "scribe" => set(
                     a,
@@ -306,6 +554,13 @@ impl Demo {
             log_i: 0,
             web_i: 1,
             out_i: 0,
+            limit_act: 0,
+            last_frame: 0,
+            mail_i: 0,
+            mail_from: Duration::ZERO,
+            threads: [None; 9],
+            scanned: false,
+            free_i: 0,
         }
     }
 
@@ -318,8 +573,10 @@ impl Demo {
 
     pub fn step(&mut self, app: &mut App) {
         let t = self.start.elapsed();
+        let new_frame = app.frame != self.last_frame;
+        self.last_frame = app.frame;
         for i in 0..app.agents.len() {
-            if app.agents[i].status.busy() && self.rand().is_multiple_of(3) {
+            if new_frame && app.agents[i].status.busy() && self.rand().is_multiple_of(3) {
                 let add = self.rand() % 400;
                 app.agents[i].tokens_in += add;
                 app.agents[i].tokens_out += add / 9;
@@ -383,8 +640,99 @@ impl Demo {
             }
             app.note(who, format!("web: {q}"));
         }
+        // the builder runs out of codex limits, carries on with opus, and goes back after the reset
+        let secs = t.as_secs();
+        if let Some(i) = app.agent_index("builder") {
+            if self.limit_act == 0 && secs >= 30 {
+                self.limit_act = 1;
+                app.demo_limit_hit(i, crate::app::now_unix() + 40);
+            } else if self.limit_act == 1 && secs >= 72 {
+                self.limit_act = 2; // check_resets has run by now and asked to go back after this run
+            } else if self.limit_act == 2 && secs >= 80 {
+                self.limit_act = 3;
+                app.agent_event(
+                    i,
+                    crate::vendors::AgentEvent::Done {
+                        ok: true,
+                        cost_usd: None,
+                    },
+                );
+                app.agents[i].status = Status::Running;
+                app.agents[i].now = "src/ui/team.rs".into();
+                app.agents[i].task = "task 6 · wt/builder".into();
+            }
+        }
+        // messages between agents, replayed every 100 seconds
+        let at = t.saturating_sub(self.mail_from).as_secs();
+        while let Some((when, from, thread, text)) = MAIL.get(self.mail_i).copied() {
+            if at < when {
+                break;
+            }
+            self.mail_i += 1;
+            let re = self.threads[thread]
+                .map(|id| format!(" re #{id}"))
+                .unwrap_or_default();
+            // through the same path real agent output takes: cards and protocol lines
+            let first_new = app.messages.last().map_or(1, |m| m.id + 1);
+            if let Some(i) = app.agent_index(from) {
+                let keep = (app.agents[i].status, app.agents[i].now.clone());
+                app.agent_event(
+                    i,
+                    crate::vendors::AgentEvent::Text(text.replace("{re}", &re)),
+                );
+                (app.agents[i].status, app.agents[i].now) = keep;
+            }
+            if app.messages.last().is_some_and(|m| m.id >= first_new) {
+                self.threads[thread].get_or_insert(first_new);
+            }
+        }
+        // the scanner catches a key in a commit: no model involved
+        if !self.scanned && at >= 77 {
+            self.scanned = true;
+            let hit = |what, file: &str, line| crate::secrets::Finding {
+                file: file.into(),
+                line,
+                what,
+            };
+            app.scanner_hit(
+                "1d93f7e",
+                &[
+                    hit("Anthropic API key", "tests/fixtures/live.env", 3),
+                    hit("email address", "tests/fixtures/live.env", 7),
+                ],
+            );
+        }
+        // the free checks and a fresh-context restart, once per pass
+        if self.free_i == 0 && at >= 100 {
+            self.free_i = 1;
+            let f = |what, file: &str, line| crate::secrets::Finding {
+                file: file.into(),
+                line,
+                what,
+            };
+            app.integrity_hit("5e2f1b7", &[f("an assert removed", "src/ui/team.rs", 0)]);
+        }
+        if self.free_i == 1 && at >= 106 {
+            self.free_i = 2;
+            let pkg = [("crates.io", "ratatui-flexbox".to_string())];
+            app.deps_checked("3c81f0e", &pkg, &pkg);
+        }
+        if self.free_i == 2 && at >= 123 {
+            self.free_i = 3;
+            if let Some(i) = app.agent_index("builder") {
+                app.refresh(i, "over 35 minutes");
+                app.agents[i].now = "fresh start: reading the handoff".into();
+            }
+        }
+        if self.mail_i == MAIL.len() && at >= 140 {
+            self.mail_i = 0;
+            self.mail_from = t;
+            self.threads = [None; 9];
+            self.scanned = false;
+            self.free_i = 0;
+        }
         // questions arrive while everyone keeps working
-        let due = [2u64, 22, 45];
+        let due = [2u64, 22, 45, 60];
         if self.asked < due.len() && t.as_secs() >= due[self.asked] {
             self.asked += 1;
             let q = match self.asked {
@@ -399,6 +747,8 @@ impl Demo {
                     ],
                     chosen: None,
                     guard_cmd: None,
+                    change: None,
+                    release: None,
                     asked: Instant::now(),
                 },
                 2 => Question {
@@ -408,9 +758,11 @@ impl Demo {
                     options: vec!["blue".into(), "white".into()],
                     chosen: None,
                     guard_cmd: None,
+                    change: None,
+                    release: None,
                     asked: Instant::now(),
                 },
-                _ => {
+                3 => {
                     let cmd = "git push origin main";
                     app.guard_events.insert(
                         0,
@@ -433,6 +785,24 @@ impl Demo {
                         options: vec!["allow once".into(), "no".into()],
                         chosen: None,
                         guard_cmd: Some(cmd.into()),
+                        change: None,
+                        release: None,
+                        asked: Instant::now(),
+                    }
+                }
+                _ => {
+                    if let Some(i) = app.agent_index("scout") {
+                        app.agents[i].say("1 recommendation for you");
+                    }
+                    Question {
+                        from: "scout".into(),
+                        task: "models".into(),
+                        text: "Move tester from claude sonnet to codex gpt-6.1-sol? demo data: in orda, tester runs on sonnet failed 3 of 11".into(),
+                        options: vec!["switch to gpt-6.1-sol".into(), "keep it".into()],
+                        chosen: None,
+                        guard_cmd: None,
+                        change: Some(Change { agent: "tester".into(), vendor: "codex".into(), model: "gpt-6.1-sol".into() }),
+                        release: None,
                         asked: Instant::now(),
                     }
                 }
@@ -442,5 +812,167 @@ impl Demo {
             }
             app.ask(q);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::App;
+
+    /// Jump the demo clock forward and play everything due by then.
+    fn at(app: &mut App, secs: u64) {
+        let mut demo = app.demo.take().unwrap();
+        demo.start = std::time::Instant::now() - std::time::Duration::from_secs(secs);
+        demo.step(app);
+        app.demo = Some(demo);
+    }
+
+    #[test]
+    fn ripple_holds_then_releases_and_teaches() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        app.cfg.notify.desktop = false;
+        at(&mut app, 41);
+        assert!(
+            app.holds
+                .iter()
+                .any(|h| h.0 == "9e1b0d4" && h.2 == "ripple")
+        );
+        let (bug_to, bug_ok, bug_thread) = app
+            .messages
+            .iter()
+            .find(|m| m.from == "ripple" && m.card.kind == "bug")
+            .map(|m| (m.to.clone(), m.card.missing().is_empty(), m.thread))
+            .unwrap();
+        assert_eq!(bug_to, "builder-2");
+        assert!(bug_ok);
+        at(&mut app, 56);
+        assert!(app.holds.is_empty(), "released after the fix held");
+        assert!(
+            app.log.iter().any(
+                |l| l.who == "ripple" && l.text.starts_with("lesson: when you change a helper")
+            )
+        );
+        let fixed = app
+            .messages
+            .iter()
+            .find(|m| m.from == "builder-2" && m.to == "ripple")
+            .unwrap();
+        assert_eq!(fixed.thread, bug_thread, "the fix answers ripple's thread");
+    }
+
+    /// Plays the whole script with no async runtime: starting a real agent would panic.
+    #[test]
+    fn demo_never_starts_a_real_agent() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        app.cfg.notify.desktop = false;
+        for s in 0..=145 {
+            at(&mut app, s);
+            for f in app.flights.iter_mut() {
+                f.start -= std::time::Duration::from_secs(2);
+            }
+            app.tick();
+        }
+        assert!(app.messages.len() >= 10, "the script ran");
+    }
+
+    #[test]
+    fn aegis_scanner_and_bursar_scenes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        app.cfg.notify.desktop = false;
+        at(&mut app, 61);
+        assert!(app.holds.iter().any(|h| h.0 == "4b08aa3" && h.2 == "aegis"));
+        at(&mut app, 73);
+        assert!(
+            !app.holds.iter().any(|h| h.0 == "4b08aa3"),
+            "released after the fix"
+        );
+        at(&mut app, 78);
+        let q = app
+            .questions
+            .iter()
+            .find(|q| q.from == "scanner")
+            .expect("the owner is asked");
+        assert_eq!(q.release.as_deref(), Some("1d93f7e"));
+        assert!(
+            app.holds
+                .iter()
+                .any(|h| h.0 == "1d93f7e" && h.2 == "scanner")
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.from == "scanner" && m.to == "aegis")
+        );
+        at(&mut app, 85);
+        assert!(
+            app.savings
+                .iter()
+                .any(|r| r.active && r.scope == "all" && r.text.starts_with("Search with grep"))
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.from == "bursar" && m.to == "scout")
+        );
+        // answering "a test value" releases the scanner's hold
+        app.q_sel = app
+            .questions
+            .iter()
+            .position(|q| q.from == "scanner")
+            .unwrap();
+        app.focus = crate::app::Focus::Questions;
+        app.handle(crate::app::Msg::Key(
+            ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Char(
+                '2',
+            )),
+        ));
+        assert!(!app.holds.iter().any(|h| h.0 == "1d93f7e"));
+    }
+
+    #[test]
+    fn referee_customs_and_curator_scenes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        app.cfg.notify.desktop = false;
+        at(&mut app, 104);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.from == "integrity" && m.to == "referee")
+        );
+        assert!(
+            app.holds
+                .iter()
+                .any(|h| h.0 == "5e2f1b7" && h.2 == "referee")
+        );
+        at(&mut app, 107);
+        assert!(
+            app.holds
+                .iter()
+                .any(|h| h.0 == "3c81f0e" && h.2 == "customs"),
+            "an invented package is held at once"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.from == "deps" && m.to == "customs")
+        );
+        at(&mut app, 120);
+        assert!(
+            !app.holds
+                .iter()
+                .any(|h| h.0 == "5e2f1b7" || h.0 == "3c81f0e"),
+            "both released"
+        );
+        assert!(app.log.iter().any(|l| l.who == "referee" && l.text.starts_with("lesson: never loosen an assert")));
+        at(&mut app, 124);
+        assert!(
+            app.log.iter().any(
+                |l| l.who == "builder" && l.text.starts_with("fresh context (over 35 minutes)")
+            )
+        );
     }
 }

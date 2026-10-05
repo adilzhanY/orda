@@ -29,7 +29,14 @@ pub fn parse(v: &Value) -> Vec<AgentEvent> {
                 .as_str()
                 .or(v["message"].as_str())
                 .unwrap_or("codex failed");
-            vec![AgentEvent::Error(short(msg, 120))]
+            if super::is_limit(msg) {
+                vec![AgentEvent::LimitHit {
+                    resets_at: super::try_again_at(msg, crate::app::now_unix()),
+                    message: short(msg, 120),
+                }]
+            } else {
+                vec![AgentEvent::Error(short(msg, 120))]
+            }
         }
         "item.started" | "item.updated" => match kind {
             "command_execution" => vec![AgentEvent::ToolCall {
@@ -112,6 +119,24 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, AgentEvent::Unknown(_))),
             "{events:?}"
+        );
+    }
+
+    #[test]
+    fn usage_limit_is_a_limit_hit() {
+        let e = parse(
+            "codex",
+            r#"{"type":"turn.failed","error":{"message":"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:05 PM."}}"#,
+        );
+        assert!(
+            matches!(
+                &e[0],
+                AgentEvent::LimitHit {
+                    resets_at: Some(_),
+                    ..
+                }
+            ),
+            "{e:?}"
         );
     }
 

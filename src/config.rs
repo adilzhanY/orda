@@ -18,6 +18,53 @@ pub struct Config {
     pub guard: Guard,
     #[serde(default = "shipped_agents")]
     pub agents: Vec<AgentDef>,
+    /// vendor -> the model its agents move to while that vendor's limit is used up
+    #[serde(default = "shipped_fallback")]
+    pub fallback: HashMap<String, Fallback>,
+    #[serde(default)]
+    pub watch: Watch,
+    #[serde(default)]
+    pub fresh: Fresh,
+}
+
+/// When a run is restarted with a fresh context and a handoff.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct Fresh {
+    pub minutes: u64,
+    pub tool_calls: u64,
+    pub context: u64,
+}
+
+impl Default for Fresh {
+    fn default() -> Self {
+        Self {
+            minutes: 35,
+            tool_calls: 80,
+            context: 160_000,
+        }
+    }
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct Watch {
+    /// Hand every new commit to the always-on agents (tester, ripple, aegis).
+    pub commits: bool,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self { commits: true }
+    }
+}
+
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+pub struct Fallback {
+    pub vendor: String,
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
 }
 
 /// The guard rules and team from the shipped file, used for whatever a user file leaves out.
@@ -25,6 +72,7 @@ pub struct Config {
 struct Shipped {
     guard: Guard,
     agents: Vec<AgentDef>,
+    fallback: HashMap<String, Fallback>,
 }
 
 fn shipped() -> Shipped {
@@ -37,6 +85,10 @@ fn shipped_guard() -> Guard {
 
 fn shipped_agents() -> Vec<AgentDef> {
     shipped().agents
+}
+
+fn shipped_fallback() -> HashMap<String, Fallback> {
+    shipped().fallback
 }
 
 fn orda() -> String {
@@ -70,7 +122,8 @@ pub struct Guard {
 #[derive(Deserialize, Clone)]
 pub struct AgentDef {
     pub name: String,
-    #[serde(default = "worker")]
+    /// A folder in agents/. Empty means the agent's name.
+    #[serde(default)]
     pub role: String,
     pub vendor: String,
     pub model: String,
@@ -82,14 +135,19 @@ pub struct AgentDef {
     pub always_on: bool,
 }
 
-fn worker() -> String {
-    "worker".into()
-}
-
 impl Default for Config {
     fn default() -> Self {
-        toml::from_str(DEFAULT).expect("default config parses")
+        finish(toml::from_str(DEFAULT).expect("default config parses"))
     }
+}
+
+fn finish(mut c: Config) -> Config {
+    for a in &mut c.agents {
+        if a.role.is_empty() {
+            a.role = a.name.clone();
+        }
+    }
+    c
 }
 
 impl Default for Layout {
@@ -130,10 +188,45 @@ pub fn load() -> (Config, Option<String>) {
     match std::fs::read_to_string(path()) {
         Err(_) => (Config::default(), None),
         Ok(text) => match toml::from_str::<Config>(&text) {
-            Ok(c) => (c, None),
+            Ok(c) => (finish(c), None),
             Err(e) => (Config::default(), Some(format!("config: {}", e.message()))),
         },
     }
+}
+
+/// Switch one agent to another vendor and model in the settings file, keeping
+/// everything else (comments included) as it is.
+pub fn set_model(name: &str, vendor: &str, model: &str) -> Result<(), String> {
+    let p = path();
+    let text = std::fs::read_to_string(&p).unwrap_or_else(|_| DEFAULT.to_string());
+    let new = set_model_in(&text, name, vendor, model)
+        .ok_or(format!("no agent named {name} in {}", p.display()))?;
+    std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&p, new).map_err(|e| e.to_string())
+}
+
+fn set_model_in(text: &str, name: &str, vendor: &str, model: &str) -> Option<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    let mut found = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            inside = false;
+        }
+        if t == format!("name = \"{name}\"") {
+            inside = true;
+            found = true;
+        }
+        if inside && t.starts_with("vendor =") {
+            out.push(format!("vendor = \"{vendor}\""));
+        } else if inside && t.starts_with("model =") {
+            out.push(format!("model = \"{model}\""));
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    found.then(|| out.join("\n") + "\n")
 }
 
 pub fn modified() -> Option<std::time::SystemTime> {
@@ -162,7 +255,19 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.agents[0].role, "boss");
         assert!(c.agents.iter().any(|a| a.always_on));
-        assert_eq!(c.layout.right.len(), 4);
+        assert_eq!(c.layout.right.len(), 6);
+    }
+
+    #[test]
+    fn set_model_touches_one_agent() {
+        let new = set_model_in(DEFAULT, "tester", "codex", "gpt-7").unwrap();
+        let c = finish(toml::from_str::<Config>(&new).unwrap());
+        let t = c.agents.iter().find(|a| a.name == "tester").unwrap();
+        assert_eq!((t.vendor.as_str(), t.model.as_str()), ("codex", "gpt-7"));
+        let b = c.agents.iter().find(|a| a.name == "builder-2").unwrap();
+        assert_eq!(b.model, "sonnet");
+        assert!(new.contains("# orda settings"));
+        assert!(set_model_in(DEFAULT, "nobody", "codex", "x").is_none());
     }
 
     #[test]

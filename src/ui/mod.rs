@@ -270,6 +270,7 @@ fn key_hints(app: &App) -> Line<'static> {
         Focus::None => &[
             ("i", "task"),
             ("q", "questions"),
+            ("s", "scout"),
             ("t", "team"),
             ("g", "git"),
             ("w", "web"),
@@ -340,17 +341,20 @@ pub fn panel(
     let mut spans = vec![Span::raw(" ")];
     spans.extend(title);
     spans.push(Span::raw(" "));
-    Block::bordered()
+    let block = Block::bordered()
         .border_type(if focused {
             BorderType::Thick
         } else {
             BorderType::Rounded
         })
         .border_style(Style::new().fg(border))
-        .title_top(Line::from(spans))
-        .title_top(
-            Line::from(Span::styled(format!(" {right} "), Style::new().fg(t.dim))).right_aligned(),
-        )
+        .title_top(Line::from(spans));
+    if right.is_empty() {
+        return block;
+    }
+    block.title_top(
+        Line::from(Span::styled(format!(" {right} "), Style::new().fg(t.dim))).right_aligned(),
+    )
 }
 
 /// Left and right spans on one line of `width`, the left side cut short if needed.
@@ -456,6 +460,62 @@ mod render {
                 }
                 println!();
             }
+        }
+    }
+
+    /// Messages caught mid-flight: `ORDA_PRINT=1 cargo test render_flights -- --nocapture`
+    #[test]
+    fn render_flights() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        for (from, to, kind, ago) in [
+            ("tester", "builder", "bug", 500),
+            ("builder-2", "reviewer", "fixed", 900),
+            ("scout", "boss", "escalation", 1000),
+        ] {
+            let card = crate::roles::Card {
+                to: to.into(),
+                re: None,
+                kind: kind.into(),
+                fields: vec![("title".into(), "x".into())],
+            };
+            app.send(from, card);
+            app.flights.last_mut().unwrap().start -= std::time::Duration::from_millis(ago);
+        }
+        let mut term = Terminal::new(TestBackend::new(196, 54)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: Vec<String> = (0..54)
+            .map(|y| (0..90).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        assert!(
+            screen.iter().any(|l| l.contains("scout -> boss")),
+            "the title names the newest flight"
+        );
+        if std::env::var("ORDA_PRINT").is_ok() {
+            println!("{}", screen.join("\n"));
+        }
+    }
+
+    /// The builder after its codex limit ran out: `ORDA_PRINT=1 cargo test render_fallback -- --nocapture`
+    #[test]
+    fn render_fallback() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true, tx);
+        let i = app.agent_index("builder").unwrap();
+        app.demo_limit_hit(i, crate::app::now_unix() + 3600);
+        let mut term = Terminal::new(TestBackend::new(196, 54)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: Vec<String> = (0..54)
+            .map(|y| (0..196).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        assert!(
+            screen.iter().any(|l| l.contains("opus · fallback")),
+            "the card says it is on a fallback"
+        );
+        if std::env::var("ORDA_PRINT").is_ok() {
+            println!("{}", screen.join("\n"));
         }
     }
 }

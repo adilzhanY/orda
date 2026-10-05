@@ -113,3 +113,18 @@ pub fn snapshot(dir: &str) -> Option<Snapshot> {
         head_files,
     })
 }
+
+/// The diff a commit added, for the secret scanner.
+pub fn show(dir: &str, hash: &str) -> String {
+    git(dir, &["show", "--format=", "--unified=0", hash]).unwrap_or_default()
+}
+
+/// The files a commit changed.
+pub fn files(dir: &str, hash: &str) -> Vec<String> {
+    git(dir, &["show", "--name-only", "--format=", hash])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}

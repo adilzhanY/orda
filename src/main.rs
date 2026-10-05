@@ -1,12 +1,19 @@
-mod agents;
 mod app;
 mod config;
 mod demo;
+mod deps;
 mod git;
 mod guard;
+mod integrity;
 mod limits;
+mod mail;
+mod roles;
+mod savings;
+mod secrets;
+mod stats;
 mod theme;
 mod ui;
+mod vendors;
 
 use app::{App, Msg};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -49,7 +56,7 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    let mut tick = tokio::time::interval(Duration::from_millis(140));
+    let mut tick = tokio::time::interval(Duration::from_millis(40));
     let mut dirty = true;
     let result = loop {
         if dirty {

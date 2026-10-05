@@ -40,17 +40,17 @@ Iris has no accents by design, so under it vendors are told apart by the model n
 ╭ team ───────────────────────────────╮ ╭ questions ─────╮ ╭ git ───────────╮
 │ [advisor]   ┏ boss ┓    [you]       │ │                │ │                │
 │                 │                   │ ╰────────────────╯ ╰────────────────╯
-│      ┌──────────┴──────────┐        │ ╭ web ───────────╮ ╭ guard ─────────╮
-│ [worker]  [worker]  [worker]        │ │                │ │                │
-│ [worker]  [worker]  [worker]        │ ╰────────────────╯ ╰────────────────╯
-╰─────────────────────────────────────╯
-╭ session log ────────────────────────╮ ╭ limits & tokens ──────────────────╮
-╰─────────────────────────────────────╯ ╰───────────────────────────────────╯
+│        ┌────────┴────────┐          │ ╭ web ───────────╮ ╭ guard ─────────╮
+│ [worker]          [worker]          │ │                │ │                │
+│ [worker]          [worker]          │ ╰────────────────╯ ╰────────────────╯
+│ [worker]          [worker]          │ ╭ session log ───╮ ╭ limits & tok ──╮
+│ [worker]                            │ │                │ │                │
+╰─────────────────────────────────────╯ ╰────────────────╯ ╰────────────────╯
 ╭ › input ──────────────────────────────────────────────────────────────────╮
  key hints
 ```
 
-Which module goes where is set in `[layout]`: `left` (the wide column, first module takes the spare height), `right` (a two-column grid, row by row) and `bottom` (one row, side by side). The left column and the right columns split 165 : 200, like the concept.
+Workers sit two to a row, three when the team column is at least 110 columns wide. Which module goes where is set in `[layout]`: `left` (the wide column, first module takes the spare height), `right` (a two-column grid, row by row) and `bottom` (one row, side by side). The left column and the right columns split 165 : 200, like the concept.
 
 **Compact mode.** Below `compact_width` x `compact_height` (default 170 x 44) the body becomes one module at a time with a tab bar on top and a one-line limits and tokens summary under it. Pressing a module key in full mode zooms that module the same way; esc returns.
 
@@ -58,31 +58,35 @@ Which module goes where is set in `[layout]`: `left` (the wide column, first mod
 
 **Panel.** Rounded border in `line`, title cut into the top border on the left (bold), a dim hint on the right. A focused panel gets a thick border.
 
-**Agent card.** 7 rows. Border: the vendor accent while running, searching or asking; `line` when idle, queued or done; `bad` when failed. The boss card has a thick border. Title: name (left, accent when active, dim otherwise), model and effort (right, effort dropped first when the border is short). Rows:
+**Agent card.** 7 rows; worker cards shrink to 6 or 5 when the team would not fit otherwise, dropping output lines first. When even that is not enough, a row where nobody is working (no run, no question, no failure, no message in flight) becomes a slim card: title border, one line with the action and badge, bottom border. Slim cards stay wired, and their row grows back as soon as one of its agents becomes active. Border: the vendor accent while running, searching or asking; `line` when idle, queued or done; `bad` when failed. The boss card has a thick border. Title: name (left, accent when active, dim otherwise), model and effort (right, effort dropped first when the border is short). Rows:
 1. spinner (only while busy) + current action, status badge on the right
-2. boss: context bar against 1M; tester: test progress bar with `passed/total`; others: their job
+2. boss: context bar against 1M; tester: test progress bar with `passed/total`; bursar: tokens per run this week against last week (`-18%` in `ok`, a rise in `bad`); others: their job
 3. and 4. the last two output lines
 5. task or worktree on the left, tokens on the right
+
+On a fallback model the right title reads `<model> · fallback` instead of the effort.
 
 Badges: `running` / `always on` (ok), `searching` (gemini), `asking` (ask), `queued` / `idle` (dim), `done` (ok), `failed` (bad), all on `badge`.
 
 **You card.** In the boss row, right of the boss. Question count with a `q` badge, who is paused on a guard answer, and how many answers are remembered. Border turns `ask` while questions wait.
 
-**Connector.** One `│` down from the boss, then `┌─┴─┬─┐` across to the centre of each card in the first worker row, in `line`.
+**Message flight.** When an agent sends a card, a block travels along the wiring from the sender's junction to the receiver's. The head is `█` in the card's colour (bug and escalation `bad`, fixed and done `ok`, review `codex`, question `ask`), with a three-cell trail `▓▒░` in the sender's accent. It takes 1.4 seconds. While it flies, the team panel's title bar shows `sender -> receiver` and the card as a coloured chip (`bug #12`). When it lands, the receiver's border takes the card's colour for 1.6 seconds and its current action changes (`fixing #12, round 1/3`).
 
-**Questions panel.** Border pulses between `ask` and `line` (about once a second) while questions wait. Each question: asker (in its accent), task, age; the question in bright. The selected one shows numbered options as chips; once one is picked, `remember for p this project · a all projects · o just once`. Guard questions skip the scope step. Below: the remembered answers, tagged `all` (fable), `project` (codex) or `once` (dim).
+**Wiring.** Every card is wired into one network, so every agent is visibly connected to the boss and to every other agent. Each card in the boss row drops a line from the middle of its bottom border (`┬`, `┳` on the boss's thick border) into the connector row, which runs across under them. A lane runs down each gap between worker columns (the gap is 3 columns wide, the lane in its middle), and every worker card plugs into the lane beside it with a short stub and a junction cut into its border (`├` on the right edge, `┤` on the left), so a row reads `├─┼─┤`. Lanes hang from the connector row. Lines are `line`; junctions keep the card's border colour. A message flight follows these wires, found by a shortest-path search, so it never crosses a card.
+
+**Questions panel.** Border pulses between `ask` and `line` (about once a second) while questions wait. Each question: asker (in its accent), task, age; the question in bright. The selected one shows numbered options as chips; once one is picked, `remember for p this project · a all projects · o just once`. Guard questions and the scout's switch-or-keep questions skip the scope step; a scout answer is remembered for all projects. Below: the remembered answers, tagged `all` (fable), `project` (codex) or `once` (dim).
 
 **Toast.** Top right, 52 x 5, `ask` border on `badge`, for 6 seconds when a question arrives: who asked, the question, "press q to answer, the team keeps working". A desktop notification (notify-send) goes out at the same time when `[notify] desktop = true`.
 
-**Git panel.** Worktrees with file count and `+added -removed`; the last 12 commits (hash in `ask`, newest highlighted) with the status orda gave them (`testing 14/20`, `in review`, `merged`, `reverted`) or their age; the newest commit's files.
+**Git panel.** Worktrees with file count and `+added -removed`; the last 12 commits (hash in `ask`, newest highlighted) with the status orda gave them (`testing 14/20`, `in review`, `merged`, `reverted`, and `held by ripple` in `bad`, which wins over any other status) or their age; the newest commit's files.
 
 **Web panel.** Newest first: who searched (accent), a spinner while live, the query, sources (dim), `learned: ...` (ok).
 
 **Guard panel.** Rules as chips in two labelled groups, `blocked` (bad) and `asks you` (ask), then every event: time, agent, verdict, command, and why.
 
-**Session log.** `HH:MM:SS`, agent name padded and coloured, text. Newest at the bottom.
+**Session log.** `HH:MM:SS`, agent name padded and coloured, text. Long entries wrap under the text column. Newest at the bottom. Model switches always appear here.
 
-**Limits & tokens.** Left: per vendor, one row per window (`5h`, `7d`, `fable`), a bar in the vendor accent (turns `ask` at 70%, `bad` at 90%), percent, time to reset. A vendor whose login expired says so in `bad`. Right: per vendor, a sparkline of tokens per 2 seconds and the total; then the session total.
+**Limits & tokens.** Side by side when the panel is at least 80 columns wide, otherwise limits above tokens. Limits: per vendor, one row per window (`5h`, `7d`, `fable`), a bar in the vendor accent (turns `ask` at 70%, `bad` at 90%), percent, time to reset. A vendor whose login expired says so in `bad`, and a vendor that is out of limits shows one `bad` row, `out of limits, back at 15:05`, in place of its bars. Tokens: per vendor, a sparkline of tokens per 2 seconds and the total; then the session total.
 
 **Input.** Rounded box, `›` in claude colour, placeholder in dim. Border turns claude colour when typing.
 
@@ -92,6 +96,7 @@ Badges: `running` / `always on` (ok), `searching` (gemini), `asking` (ask), `que
 |---|---|---|
 | `i` or `/` | anywhere | type a task, enter sends it to the boss, esc leaves |
 | `q` | anywhere | answer questions |
+| `s` | anywhere | run the bursar's spending review and then the scout's model scan |
 | `1`..`9` | questions | pick an option |
 | `p` `a` `o` | questions | remember for this project, all projects, just once |
 | `j` `k` | questions | move between questions |

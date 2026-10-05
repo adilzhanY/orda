@@ -204,7 +204,14 @@ pub fn git(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(Span::styled("commits", dim)));
     for (i, c) in g.commits.iter().enumerate() {
-        let (label, color) = match &c.status {
+        let held = app
+            .holds
+            .iter()
+            .find(|h| h.0.starts_with(&c.hash) || c.hash.starts_with(&h.0));
+        let status = held
+            .map(|h| (format!("held by {}", h.2), Tone::Bad))
+            .or(c.status.clone());
+        let (label, color) = match &status {
             Some((s, tone)) => (
                 s.clone(),
                 match tone {
@@ -384,22 +391,33 @@ pub fn log(f: &mut Frame, app: &App, area: Rect) {
     );
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let n = inner.height as usize;
-    let lines = app
+    // long entries wrap under the message column; the newest lines stay at the bottom
+    const INDENT: usize = 9 + 11;
+    let room = (inner.width as usize).saturating_sub(2 + INDENT).max(10);
+    let mut lines: Vec<Line> = vec![];
+    for l in app
         .log
         .iter()
-        .skip(app.log.len().saturating_sub(n))
-        .map(|l| {
-            Line::from(vec![
-                Span::styled(format!("{} ", l.at), Style::new().fg(t.dim)),
-                Span::styled(
-                    format!("{:<11}", l.who),
-                    Style::new().fg(app.accent_of(&l.who)),
-                ),
-                Span::styled(l.text.clone(), Style::new().fg(t.text)),
-            ])
-        })
-        .collect();
+        .skip(app.log.len().saturating_sub(inner.height as usize))
+    {
+        for (k, chunk) in wrap(&l.text, room).into_iter().enumerate() {
+            let head = if k == 0 {
+                vec![
+                    Span::styled(format!("{} ", l.at), Style::new().fg(t.dim)),
+                    Span::styled(
+                        format!("{:<11}", l.who),
+                        Style::new().fg(app.accent_of(&l.who)),
+                    ),
+                ]
+            } else {
+                vec![Span::raw(" ".repeat(INDENT))]
+            };
+            lines.push(Line::from(
+                [head, vec![Span::styled(chunk, Style::new().fg(t.text))]].concat(),
+            ));
+        }
+    }
+    let lines = lines.split_off(lines.len().saturating_sub(inner.height as usize));
     body(f, inner, lines);
 }
 
@@ -419,9 +437,22 @@ pub fn usage(f: &mut Frame, app: &App, area: Rect) {
         width: inner.width.saturating_sub(2),
         ..inner
     };
-    let [left, right] = Layout::horizontal([Constraint::Fill(11), Constraint::Fill(10)])
-        .spacing(3)
-        .areas(inner);
+    // side by side when there is room, limits above tokens when not
+    let [left, right] = if inner.width >= 80 {
+        Layout::horizontal([Constraint::Fill(11), Constraint::Fill(10)])
+            .spacing(3)
+            .areas(inner)
+    } else {
+        let rows = app
+            .limits
+            .iter()
+            .map(|s| s.windows.len().max(1))
+            .sum::<usize>()
+            .max(1) as u16;
+        Layout::vertical([Constraint::Length(rows), Constraint::Fill(1)])
+            .spacing(1)
+            .areas(inner)
+    };
     let now = now_unix();
 
     let mut lim = vec![];
@@ -445,6 +476,16 @@ pub fn usage(f: &mut Frame, app: &App, area: Rect) {
             lim.push(Line::from(vec![
                 Span::styled(format!("{:<7}", s.vendor), Style::new().fg(c)),
                 Span::styled(why, Style::new().fg(t.bad)),
+            ]));
+            continue;
+        }
+        if let Some(until) = app.blocked.get(&s.vendor).filter(|t| **t > now) {
+            lim.push(Line::from(vec![
+                Span::styled(format!("{:<7}", s.vendor), Style::new().fg(c)),
+                Span::styled(
+                    format!("out of limits, back at {}", crate::app::hhmm(*until)),
+                    Style::new().fg(t.bad),
+                ),
             ]));
             continue;
         }
@@ -482,12 +523,7 @@ pub fn usage(f: &mut Frame, app: &App, area: Rect) {
     let mut tok = vec![];
     let mut total = 0;
     for vendor in ["claude", "codex", "gemini"] {
-        let sum: u64 = app
-            .agents
-            .iter()
-            .filter(|a| a.def.vendor == vendor)
-            .map(|a| a.tokens())
-            .sum();
+        let sum: u64 = app.agents.iter().map(|a| a.tokens_on(vendor)).sum();
         if !app.agents.iter().any(|a| a.def.vendor == vendor) {
             continue;
         }
@@ -527,6 +563,13 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         if s.error.is_some() {
             spans.push(Span::styled(" login expired", Style::new().fg(t.bad)));
         }
+        if let Some(until) = app.blocked.get(&s.vendor).filter(|u| **u > now_unix()) {
+            spans.push(Span::styled(
+                format!(" out until {}   ", crate::app::hhmm(*until)),
+                Style::new().fg(t.bad),
+            ));
+            continue;
+        }
         for w in s.windows.iter() {
             spans.push(Span::styled(
                 format!(" {} ", w.label),
@@ -548,4 +591,40 @@ pub fn status_line(app: &App, width: u16) -> Line<'static> {
         ],
         width,
     )
+}
+
+/// Split text into lines of at most `width` characters, breaking at spaces when it can.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    for word in text.split(' ') {
+        let len = cur.chars().count();
+        if len > 0 && len + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+        while cur.chars().count() > width {
+            let head: String = cur.chars().take(width).collect();
+            cur = cur.chars().skip(width).collect();
+            out.push(head);
+        }
+    }
+    out.push(cur);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn wrap_breaks_at_spaces() {
+        assert_eq!(
+            super::wrap("switched gpt-6.1-sol -> opus (claude)", 20),
+            ["switched gpt-6.1-sol", "-> opus (claude)"]
+        );
+        assert_eq!(super::wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(super::wrap("short", 20), ["short"]);
+    }
 }

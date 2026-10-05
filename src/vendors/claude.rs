@@ -15,7 +15,32 @@ pub fn parse(v: &Value) -> Vec<AgentEvent> {
         "system" => vec![],
         "assistant" => assistant(&v["message"]),
         "user" => tool_results(&v["message"]),
-        "rate_limit_event" => limits(&v["rate_limit_info"]),
+        "rate_limit_event" => {
+            let info = &v["rate_limit_info"];
+            let mut out = limits(info);
+            // rejected and not covered by paid overage: this run cannot go on
+            let overage = info["overageStatus"].as_str().unwrap_or("");
+            if info["status"] == "rejected" && overage != "allowed" && overage != "allowed_warning"
+            {
+                out.push(AgentEvent::LimitHit {
+                    resets_at: info["resetsAt"].as_i64(),
+                    message: format!(
+                        "claude {} limit reached",
+                        info["rateLimitType"].as_str().unwrap_or("usage")
+                    ),
+                });
+            }
+            out
+        }
+        "result"
+            if v["is_error"] == true
+                && (v["api_error_status"] == 429 || super::is_limit(s("result"))) =>
+        {
+            vec![AgentEvent::LimitHit {
+                resets_at: None,
+                message: short(s("result"), 120),
+            }]
+        }
         "result" => {
             let u = &v["usage"];
             let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
@@ -144,6 +169,25 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, AgentEvent::Unknown(_))),
             "{events:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_limit_is_a_limit_hit() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1791161400,"rateLimitType":"five_hour","overageStatus":"rejected"}}"#;
+        let e = parse("claude", line);
+        assert!(
+            e.contains(&AgentEvent::LimitHit {
+                resets_at: Some(1791161400),
+                message: "claude five_hour limit reached".into()
+            }),
+            "{e:?}"
+        );
+        let warn = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1}}"#;
+        assert!(
+            !parse("claude", warn)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::LimitHit { .. }))
         );
     }
 

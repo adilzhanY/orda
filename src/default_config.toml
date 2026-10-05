@@ -14,9 +14,9 @@ theme = "orda"
 # left is the wide column; its first module takes the spare height.
 left = ["team"]
 # right is a two-column grid, filled row by row.
-right = ["questions", "git", "web", "guard"]
+right = ["questions", "git", "web", "guard", "log", "usage"]
 # bottom is one row under everything, modules side by side.
-bottom = ["log", "usage"]
+bottom = []
 bottom_height = 9
 # Below this size orda shows one module at a time, as tabs.
 compact_width = 170
@@ -26,13 +26,41 @@ compact_height = 44
 # Desktop notification (notify-send) when an agent asks you something.
 desktop = true
 
+[watch]
+# Every new commit in the repo goes to the always-on agents (tester, ripple, aegis,
+# referee, and customs when a manifest changed) as a
+# task, and through orda's secret scanner (no tokens). Set false to start them by hand.
+commits = true
+
+[fresh]
+# A run past any of these limits is restarted with a fresh context and a handoff
+# (its task and everything it did). Models get worse the longer a run goes.
+minutes = 35
+tool_calls = 80
+context = 160000
+
 [guard]
-# Blocked outright. "*" matches anything.
-deny = ["rm -rf /", "rm -rf ~", "rm -rf $HOME", "dd * of=/dev/*", "mkfs*", "curl * | sh", "curl * | bash", "wget * | sh", "chmod -R 777 /*"]
+# Blocked outright. "*" matches anything. A command is also found inside quotes, $( ),
+# and after wrappers like sudo, env, eval, nohup or xargs. This is a seatbelt, not a sandbox.
+deny = ["rm -rf /", "rm -rf ~", "rm -rf $HOME", "rm -fr /", "rm -fr ~", "dd * of=/dev/*", "mkfs*", "curl * | sh", "curl * | bash", "wget * | sh", "chmod -R 777 /*"]
 # Pause that one agent and ask you. Every other agent keeps working.
 ask = ["git push*", "sudo *", "git reset --hard*", "rm -rf *"]
 
-# The team. role is "boss", "advisor" or "worker". vendor is "claude", "codex" or "gemini".
+# When a vendor's plan limit runs out, its agents move to this model at once and carry
+# on with the same task. They go back to their own model when the limit resets.
+# If the fallback is used up too, its own fallback is tried; if every one is, the agent
+# waits and resumes by itself.
+[fallback]
+codex = { vendor = "claude", model = "opus", effort = "high" }
+claude = { vendor = "codex", model = "gpt-6.1-sol", effort = "high" }
+gemini = { vendor = "claude", model = "sonnet", effort = "medium" }
+
+# The team. role is a folder in orda's agents/ (boss, advisor, builder, designer,
+# tester, reviewer, researcher, scribe, scout, ripple, aegis, bursar, referee, customs,
+# anchor, curator); its AGENT.md tells the agent how to work.
+# Two agents can share a role, like builder and builder-2. A copy of an AGENT.md
+# (or TEAM.md) in ~/.config/orda/agents/ replaces the built-in one.
+# vendor is "claude", "codex" or "gemini".
 [[agents]]
 name = "boss"
 role = "boss"
@@ -51,13 +79,15 @@ job = "on call, never writes code"
 
 [[agents]]
 name = "builder"
+role = "builder"
 vendor = "codex"
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 effort = "high"
 job = "implements tasks"
 
 [[agents]]
 name = "builder-2"
+role = "builder"
 vendor = "claude"
 model = "sonnet"
 effort = "medium"
@@ -65,6 +95,7 @@ job = "implements tasks"
 
 [[agents]]
 name = "tester"
+role = "tester"
 vendor = "claude"
 model = "sonnet"
 effort = "medium"
@@ -73,6 +104,7 @@ always_on = true
 
 [[agents]]
 name = "researcher"
+role = "researcher"
 vendor = "gemini"
 model = "flash"
 effort = "low"
@@ -80,14 +112,93 @@ job = "web research for the others"
 
 [[agents]]
 name = "reviewer"
+role = "reviewer"
 vendor = "codex"
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 effort = "high"
 job = "reviews every commit"
 
 [[agents]]
 name = "scribe"
+role = "scribe"
 vendor = "gemini"
 model = "flash"
 effort = "low"
 job = "keeps the four docs current"
+
+[[agents]]
+name = "ripple"
+role = "ripple"
+vendor = "codex"
+model = "gpt-6.1-sol"
+effort = "high"
+job = "finds what a commit broke elsewhere"
+always_on = true
+
+[[agents]]
+name = "scout"
+role = "scout"
+vendor = "claude"
+model = "sonnet"
+effort = "medium"
+job = "tracks new models, recommends switches"
+
+[[agents]]
+name = "aegis"
+role = "aegis"
+vendor = "claude"
+model = "opus"
+effort = "high"
+job = "security: secrets, personal data, holes"
+always_on = true
+
+[[agents]]
+name = "bursar"
+role = "bursar"
+vendor = "claude"
+model = "sonnet"
+effort = "medium"
+job = "teaches the team to spend fewer tokens"
+
+[[agents]]
+name = "referee"
+role = "referee"
+vendor = "claude"
+model = "sonnet"
+effort = "high"
+job = "checks every claim and that no test was bent"
+always_on = true
+
+[[agents]]
+name = "customs"
+role = "customs"
+vendor = "claude"
+model = "sonnet"
+effort = "medium"
+job = "checks packages, versions and licenses"
+always_on = true
+
+[[agents]]
+name = "anchor"
+role = "anchor"
+vendor = "claude"
+model = "sonnet"
+effort = "high"
+job = "turns tasks into criteria, checks them at the end"
+
+[[agents]]
+name = "curator"
+role = "curator"
+vendor = "claude"
+model = "haiku"
+effort = "low"
+job = "keeps MAP.md, keeps instructions lean"
+
+# Ready to add: a designer for projects with a UI.
+# [[agents]]
+# name = "designer"
+# role = "designer"
+# vendor = "claude"
+# model = "opus"
+# effort = "high"
+# job = "specs the look before builders build it"

@@ -22,22 +22,42 @@ pub fn check(rules: &Guard, cmd: &str) -> Verdict {
 
 /// True when the pattern's pieces appear in order and the pattern's first piece
 /// starts a command (the start of the line or after `;`, `&&`, `||`, `|`).
+/// Words that run whatever follows them as a command.
+const WRAPPERS: &[&str] = &[
+    "sudo ", "doas ", "env ", "command ", "exec ", "eval ", "nohup ", "time ", "nice ", "xargs ",
+];
+
 fn matches(pattern: &str, cmd: &str) -> bool {
     let pattern = pattern.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or("");
-    let starts = std::iter::once(0).chain(
-        cmd.match_indices([';', '&', '|'])
-            .map(|(i, _)| i + 1)
-            .chain(cmd.match_indices("sudo ").map(|(i, _)| i + 5)),
-    );
+    // a command can start at the beginning, after a separator, inside quotes or $( )
+    // (bash -c "...", eval '...'), or after a wrapper that runs the rest of the line
+    let mut starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            cmd.char_indices()
+                .filter(|(_, c)| ";&|'\"`(".contains(*c))
+                .map(|(i, _)| i + 1),
+        )
+        .collect();
+    for w in WRAPPERS {
+        for (i, _) in cmd.match_indices(w) {
+            if i == 0 || cmd[..i].ends_with([' ', ';', '&', '|', '\'', '"', '`', '(']) {
+                starts.push(i + w.len());
+            }
+        }
+    }
     starts.into_iter().any(|start| {
         let rest = cmd[start..].trim_start();
         let Some(mut rest) = rest.strip_prefix(first) else {
             return false;
         };
-        // a pattern without '*' must end at a word boundary: "rm -rf /" is not "rm -rf /tmp/x"
-        if !pattern.contains('*') && !(rest.is_empty() || rest.starts_with([' ', ';', '&', '|'])) {
+        // a pattern without '*' must end at a word boundary: "rm -rf /" is not "rm -rf /tmp/x",
+        // but it is "rm -rf /*"
+        if !pattern.contains('*')
+            && !(rest.is_empty()
+                || rest.starts_with([' ', ';', '&', '|', '\'', '"', '`', ')', '*']))
+        {
             return false;
         }
         for part in parts.clone() {
@@ -71,7 +91,18 @@ mod tests {
         assert_eq!(check(&r, "git push origin main"), Ask);
         assert_eq!(check(&r, "sudo pacman -S x"), Ask);
         assert_eq!(check(&r, "cargo test"), Allow);
-        assert_eq!(check(&r, "echo 'git push is in a string'"), Allow);
+        // quoted text may be run by bash -c, so the guard asks: a false alarm costs one question
+        assert_eq!(check(&r, "echo 'git push is in a string'"), Ask);
         assert_eq!(check(&r, "ls"), Allow);
+        // found by thinking like aegis: wrappers and quotes used to hide a command
+        assert_eq!(check(&r, "bash -c \"rm -rf /\""), Deny);
+        assert_eq!(check(&r, "sh -c 'rm -rf ~'"), Deny);
+        assert_eq!(check(&r, "eval rm -rf /"), Deny);
+        assert_eq!(check(&r, "echo $(rm -rf /)"), Deny);
+        assert_eq!(check(&r, "nohup rm -rf ~ &"), Deny);
+        assert_eq!(check(&r, "rm -fr /"), Deny);
+        assert_eq!(check(&r, "rm -rf /*"), Deny);
+        assert_eq!(check(&r, "env git push origin main"), Ask);
+        assert_eq!(check(&r, "grep -r 'rm -rf' docs"), Allow);
     }
 }
