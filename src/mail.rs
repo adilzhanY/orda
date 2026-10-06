@@ -38,13 +38,14 @@ impl Flight {
     }
 }
 
-/// Cards that need the receiver to act start a run. `done` and `note` only inform:
+/// Cards that need the receiver to act start a run. `done`, `fixed` and `note` only
+/// inform (a builder's fix is checked by the next round anyway):
 /// they wait for the receiver's next run, so two polite agents cannot thank each
 /// other forever.
 pub fn wakes(kind: &str) -> bool {
     matches!(
         kind,
-        "task" | "bug" | "review" | "question" | "escalation" | "fixed" | "failure"
+        "task" | "bug" | "review" | "question" | "escalation" | "failure"
     )
 }
 

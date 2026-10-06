@@ -753,6 +753,7 @@ impl Demo {
                     guard_cmd: None,
                     change: None,
                     release: None,
+                    budget: false,
                     asked: Instant::now(),
                 },
                 2 => Question {
@@ -764,6 +765,7 @@ impl Demo {
                     guard_cmd: None,
                     change: None,
                     release: None,
+                    budget: false,
                     asked: Instant::now(),
                 },
                 3 => {
@@ -791,6 +793,7 @@ impl Demo {
                         guard_cmd: Some(cmd.into()),
                         change: None,
                         release: None,
+                        budget: false,
                         asked: Instant::now(),
                     }
                 }
@@ -807,6 +810,7 @@ impl Demo {
                         guard_cmd: None,
                         change: Some(Change { agent: "tester".into(), vendor: "codex".into(), model: "gpt-6-sol".into() }),
                         release: None,
+                        budget: false,
                         asked: Instant::now(),
                     }
                 }

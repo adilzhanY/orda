@@ -3,6 +3,10 @@
 # "orda" (coral, blue and teal on dark grey) or "iris" (black and white).
 theme = "orda"
 
+# Answer agents' questions with their recommended option, without asking you.
+# Guard commands, the budget question and leaked secrets still ask. Shift+A toggles it.
+autopilot = false
+
 # Override any theme colour with "#rrggbb". bg = "none" keeps the terminal's own background.
 # Keys: bg, text, bright, dim, line, badge, claude, codex, gemini, fable, ask, ok, bad
 [colors]
@@ -27,10 +31,16 @@ compact_height = 44
 desktop = true
 
 [watch]
-# Every new commit in the repo goes to the always-on agents (tester, ripple, aegis,
-# referee, and customs when a manifest changed) as a
-# task, and through orda's secret scanner (no tokens). Set false to start them by hand.
+# When a builder's run ends with new work on its branch, the checking agents look at it
+# (the tester, the reviewer and the referee; ripple, aegis and customs when the change
+# calls for them), at most 3 rounds per branch. Every commit also goes through orda's
+# free scanners. Set false to skip the checking agents.
 commits = true
+
+[budget]
+# Runs one task may start before orda asks whether to go on, and runs at the same time.
+runs_per_task = 60
+parallel = 4
 
 [fresh]
 # A run past any of these limits is restarted with a fresh context and a handoff
@@ -43,8 +53,9 @@ context = 160000
 # Blocked outright. "*" matches anything. A command is also found inside quotes, $( ),
 # and after wrappers like sudo, env, eval, nohup or xargs. This is a seatbelt, not a sandbox.
 deny = ["rm -rf /", "rm -rf ~", "rm -rf $HOME", "rm -fr /", "rm -fr ~", "dd * of=/dev/*", "mkfs*", "curl * | sh", "curl * | bash", "wget * | sh", "chmod -R 777 /*"]
-# Pause that one agent and ask you. Every other agent keeps working.
-ask = ["git push*", "sudo *", "git reset --hard*", "rm -rf *"]
+# Pause that one agent and ask you. Every other agent keeps working. A recursive rm
+# also asks when it reaches outside the agent's folder and /tmp.
+ask = ["git push*", "sudo *", "git reset --hard*"]
 
 # When a vendor's plan limit runs out, its agents move to this model at once and carry
 # on with the same task. They go back to their own model when the limit resets.

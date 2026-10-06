@@ -21,7 +21,7 @@ You do not wait for tasks. Pick the newest commit you have not tested yet. Its b
 
 ## Your folder
 
-When orda hands you a commit, your folder is a worktree already set to exactly that commit, on your own branch (`wt/<your name>`). Build and run it there. Anything you commit (a proof test, a new test) stays on your branch, and the boss can merge it.
+When orda hands you a builder's work, your folder is a worktree set to exactly that commit, on your own branch (`wt/<your name>`). Build and run it there. Tests you add, commit there: the boss merges them together with the builder's work.
 
 ## How you work
 

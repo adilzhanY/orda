@@ -249,7 +249,12 @@ pub fn git(f: &mut Frame, app: &App, area: Rect) {
         let status = held
             .map(|h| (format!("held by {}", h.2), Tone::Bad))
             .or_else(|| {
-                checking.map(|(_, (_, p))| (format!("checking, {} left", p.len()), Tone::Busy))
+                checking.map(|(_, r)| {
+                    (
+                        format!("round {}, {} checking", r.round, r.pending.len()),
+                        Tone::Busy,
+                    )
+                })
             })
             .or(c.status.clone())
             .or_else(|| {

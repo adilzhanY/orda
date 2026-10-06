@@ -25,6 +25,30 @@ pub struct Config {
     pub watch: Watch,
     #[serde(default)]
     pub fresh: Fresh,
+    #[serde(default)]
+    pub budget: Budget,
+    /// Agents' questions are answered with their recommended option, without asking.
+    /// Guard questions, the budget question and secret-scanner hits still ask.
+    #[serde(default)]
+    pub autopilot: bool,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct Budget {
+    /// Runs a task may start before orda asks whether to go on.
+    pub runs_per_task: u32,
+    /// Runs at the same time; more wait for a free slot.
+    pub parallel: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            runs_per_task: 60,
+            parallel: 4,
+        }
+    }
 }
 
 /// When a run is restarted with a fresh context and a handoff.

@@ -108,6 +108,9 @@ pub fn spawn<M: Send + 'static>(
                 "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,TodoWrite",
             ]);
             c.args(["--settings", &hook_settings()]);
+            // the owner's own Claude Code settings (their hooks, notifications, sounds,
+            // session-start context) stay out of agent runs; orda passes what agents need
+            c.args(["--setting-sources", "project,local"]);
             c
         }
         "codex" => {
@@ -120,6 +123,10 @@ pub fn spawn<M: Send + 'static>(
                 "-c",
                 "sandbox_workspace_write.network_access=true",
             ]);
+            // the owner's notify script would pop up after every agent run
+            c.args(["-c", "notify=[]"]);
+            // codex keeps .git read-only in its sandbox, so it cannot commit: orda commits
+            // what it leaves in its folder when the run ends (App::commit_leftovers)
             c.arg("-C").arg(dir);
             if !effort.is_empty() {
                 c.args(["-c", &format!("model_reasoning_effort={effort}")]);

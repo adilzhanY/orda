@@ -39,6 +39,17 @@ pub enum Msg {
     },
 }
 
+/// One round of checks on a builder's branch.
+#[derive(Clone, Debug)]
+pub struct Round {
+    pub branch: String,
+    /// Agents still checking.
+    pub pending: Vec<String>,
+    /// A checker sent a bug or review card back: no merge, the builder goes again.
+    pub changes: bool,
+    pub round: u8,
+}
+
 /// Where the owner's current task is: anchor writes criteria, the boss works, anchor checks.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Stage {
@@ -197,6 +208,8 @@ pub struct Question {
     pub change: Option<Change>,
     /// Set for a scanner hit: the second option releases this held commit.
     pub release: Option<String>,
+    /// The run budget question: go on, or stop the task.
+    pub budget: bool,
     pub asked: Instant,
 }
 
@@ -339,8 +352,12 @@ pub struct App {
     /// Tokens per run this week against last week, "-12%".
     pub burn: Option<String>,
     jobs_started: bool,
-    /// Commits the referee has been asked to verify a claim about.
-    verified: std::collections::HashSet<String>,
+    pub autopilot: bool,
+    /// Runs started for the current task, and how many it may start before asking.
+    runs: u32,
+    run_limit: u32,
+    /// Starts waiting for a free slot or for the owner's yes on the budget.
+    later: VecDeque<(usize, String)>,
     /// When the owner's current task started and finished, and how often orda had to wake an idle boss.
     pub task_started: Option<Instant>,
     pub task_done: Option<Instant>,
@@ -349,7 +366,9 @@ pub struct App {
     /// The first message id of anchor's final check, to see what it sent.
     verify_from: u32,
     /// commit -> (its branch, agents still checking it); the boss is woken when it empties
-    pub checks: HashMap<String, (String, Vec<String>)>,
+    pub checks: HashMap<String, Round>,
+    /// branch -> check rounds so far this task, and the tip last checked
+    rounds: HashMap<String, (u8, String)>,
     /// The owner's current task and how far it is.
     pub flow: Option<(Stage, String)>,
     /// Commits already handed to the always-on agents and the scanner.
@@ -364,6 +383,10 @@ pub struct App {
 const SECOND: Duration = Duration::from_secs(1);
 /// How often orda wakes an idle boss before it calls the task stalled.
 const MAX_NUDGES: u8 = 3;
+/// Rounds of checks a branch gets per task before the boss decides by itself.
+const MAX_ROUNDS: u8 = 3;
+/// The extra option on agents' questions that turns autopilot on.
+const ACCEPT_ALL: &str = "accept all from now on";
 /// How long nothing must run before orda wakes the boss.
 const QUIET: Duration = Duration::from_secs(20);
 const AUDIT_TASK: &str = "Run your weekly audit of the whole project.";
@@ -418,13 +441,17 @@ impl App {
             seen: Default::default(),
             flow: None,
             jobs_started: false,
-            verified: Default::default(),
+            autopilot: false,
+            runs: 0,
+            run_limit: 0,
+            later: VecDeque::new(),
             task_started: None,
             task_done: None,
             nudges: 0,
             quiet_since: None,
             verify_from: 0,
             checks: HashMap::new(),
+            rounds: HashMap::new(),
             messages: vec![],
             flights: vec![],
             digest: vec![],
@@ -433,6 +460,7 @@ impl App {
         if let Some(e) = err {
             app.note("orda", e);
         }
+        app.autopilot = app.cfg.autopilot;
         if demo {
             app.demo = Some(Demo::seed(&mut app));
         } else {
@@ -472,7 +500,22 @@ impl App {
         }
     }
 
-    pub fn ask(&mut self, q: Question) {
+    pub fn ask(&mut self, mut q: Question) {
+        // guard commands, the budget and leaked secrets always come to the owner
+        let owners_only = q.guard_cmd.is_some() || q.budget || q.release.is_some();
+        if self.autopilot && !owners_only && !q.options.is_empty() {
+            let pick = q.options[0].clone();
+            self.note(&q.from.clone(), format!("asked: {}", q.text));
+            self.note("autopilot", format!("picked \"{pick}\" for {}", q.from));
+            q.chosen = Some(0);
+            self.questions.push(q);
+            self.q_sel = self.questions.len() - 1;
+            self.answer(Scope::Once);
+            return;
+        }
+        if !owners_only {
+            q.options.push(ACCEPT_ALL.into());
+        }
         let head = format!("new question from {}", q.from);
         self.note(&q.from.clone(), format!("asked you: {}", q.text));
         if self.cfg.notify.desktop {
@@ -578,6 +621,7 @@ impl App {
             if !self.demo_mode {
                 self.check_fresh();
                 self.check_idle();
+                self.run_later();
             }
             dirty = true; // the elapsed clock moves every second
         }
@@ -695,6 +739,14 @@ impl App {
             Focus::None => match k.code {
                 KeyCode::Char('i') | KeyCode::Char('/') => self.focus = Focus::Input,
                 KeyCode::Char('s') => self.scan(),
+                KeyCode::Char('A') => {
+                    self.autopilot = !self.autopilot;
+                    let state = if self.autopilot { "on" } else { "off" };
+                    self.note("you", format!("autopilot {state}"));
+                }
+                KeyCode::Char('X') if !self.task.is_empty() && self.task_done.is_none() => {
+                    self.stop_task()
+                }
                 KeyCode::Esc => self.zoom = None,
                 KeyCode::Tab | KeyCode::BackTab => {
                     let mods = self.modules();
@@ -743,9 +795,29 @@ impl App {
         if option >= q.options.len() {
             return;
         }
+        if q.options[option] == ACCEPT_ALL {
+            // the recommended option now, and every later question too
+            q.chosen = Some(0);
+            self.autopilot = true;
+            self.note("you", "autopilot on: agents' questions get their recommended answer (guard, budget and secrets still ask)");
+            self.answer(Scope::Once);
+            let open: Vec<usize> = (0..self.questions.len())
+                .filter(|k| {
+                    !self.questions[*k].budget
+                        && self.questions[*k].guard_cmd.is_none()
+                        && self.questions[*k].release.is_none()
+                })
+                .collect();
+            for k in open.into_iter().rev() {
+                self.q_sel = k;
+                self.questions[k].chosen = Some(0);
+                self.answer(Scope::Once);
+            }
+            return;
+        }
         q.chosen = Some(option);
-        // guard, scout and scanner questions have no scope step
-        if q.guard_cmd.is_some() || q.change.is_some() || q.release.is_some() {
+        // guard, scout, scanner and budget questions have no scope step
+        if q.guard_cmd.is_some() || q.change.is_some() || q.release.is_some() || q.budget {
             self.answer(Scope::Once);
         }
     }
@@ -797,6 +869,19 @@ impl App {
             }
             return;
         }
+        if q.budget {
+            if choice == 0 {
+                self.run_limit += self.cfg.budget.runs_per_task;
+                self.note(
+                    "you",
+                    format!("go on: up to {} runs for this task", self.run_limit),
+                );
+                self.run_later();
+            } else {
+                self.stop_task();
+            }
+            return;
+        }
         if let Some(commit) = &q.release {
             if choice == 1 {
                 self.holds.retain(|h| h.0 != *commit);
@@ -839,6 +924,9 @@ impl App {
         self.task_started = Some(Instant::now());
         self.task_done = None;
         self.nudges = 0;
+        self.rounds.clear();
+        self.runs = 0;
+        self.run_limit = self.cfg.budget.runs_per_task;
         if !self.demo_mode {
             match work::ensure_repo(std::path::Path::new(&self.cwd)) {
                 Ok(true) => {
@@ -859,19 +947,6 @@ impl App {
                 }
             }
             self.git = git::snapshot(&self.cwd);
-            // the periodic reviews start with the first real task, not when orda opens
-            if !self.jobs_started {
-                self.jobs_started = true;
-                let stale = |job: &str, every: i64| {
-                    stats::last_run(job).is_none_or(|t| now_unix() - t > every)
-                };
-                if stale("scout", SCOUT_EVERY) {
-                    self.scan();
-                }
-                if stale("aegis-audit", AUDIT_EVERY) && git::recent_all(&self.cwd).len() > 3 {
-                    self.audit();
-                }
-            }
         }
         if self.demo_mode {
             self.note(
@@ -900,7 +975,31 @@ impl App {
     }
 
     /// Run one agent on a task, with its role's instructions.
-    fn start(&mut self, i: usize, task: &str) {
+    pub(crate) fn start(&mut self, i: usize, task: &str) {
+        if !self.demo_mode {
+            let busy = self.agents.iter().filter(|a| a.status.busy()).count();
+            let over = !self.task.is_empty()
+                && self.task_done.is_none()
+                && self.run_limit > 0
+                && self.runs >= self.run_limit;
+            if busy >= self.cfg.budget.parallel.max(1) || over {
+                if over && !self.questions.iter().any(|q| q.budget) {
+                    self.ask_budget();
+                }
+                let a = &mut self.agents[i];
+                a.status = Status::Queued;
+                a.now = if over {
+                    "waiting for your yes on the budget".into()
+                } else {
+                    "waiting for a free slot".into()
+                };
+                self.later.push_back((i, task.to_string()));
+                return;
+            }
+            if !self.task.is_empty() && self.task_done.is_none() {
+                self.runs += 1;
+            }
+        }
         let mut task = task.to_string();
         if self.agents[i].def.role == "boss" && !self.holds.is_empty() {
             task += "\n\n## Commits on hold: do not merge these\n\n";
@@ -1138,6 +1237,82 @@ impl App {
         }
     }
 
+    fn ask_budget(&mut self) {
+        let n = self.runs;
+        self.ask(Question {
+            from: "orda".into(),
+            task: "budget".into(),
+            text: format!("This task has started {n} agent runs. Go on?"),
+            options: vec![
+                format!("go on, {} more runs", self.cfg.budget.runs_per_task),
+                "stop the task".into(),
+            ],
+            chosen: None,
+            guard_cmd: None,
+            change: None,
+            release: None,
+            budget: true,
+            asked: Instant::now(),
+        });
+    }
+
+    /// Start what waited for a free slot, while slots and budget allow.
+    fn run_later(&mut self) {
+        let mut tries = self.later.len();
+        while tries > 0 {
+            tries -= 1;
+            let busy = self.agents.iter().filter(|a| a.status.busy()).count();
+            let over = !self.task.is_empty()
+                && self.task_done.is_none()
+                && self.run_limit > 0
+                && self.runs >= self.run_limit;
+            if busy >= self.cfg.budget.parallel.max(1) || over {
+                return;
+            }
+            let Some((i, task)) = self.later.pop_front() else {
+                return;
+            };
+            self.start(i, &task);
+        }
+    }
+
+    /// The owner stopped the task: nothing new starts, running agents are stopped.
+    fn stop_task(&mut self) {
+        self.later.clear();
+        self.flow = None;
+        for a in self.agents.iter_mut() {
+            a.queue.clear();
+            a.inbox.clear();
+            if let Some(h) = a.handle.take() {
+                h.abort();
+            }
+            if a.status.busy() || a.status == Status::Queued {
+                a.status = Status::Idle;
+                a.now = "stopped".into();
+            }
+            a.run = None;
+        }
+        self.checks.clear();
+        self.task_done = Some(Instant::now());
+        self.note("orda", "the task was stopped");
+    }
+
+    /// Periodic reviews run between tasks, never while one is being built.
+    fn periodic_jobs(&mut self) {
+        if self.demo_mode || self.jobs_started {
+            return;
+        }
+        self.jobs_started = true;
+        let stale =
+            |job: &str, every: i64| stats::last_run(job).is_none_or(|t| now_unix() - t > every);
+        if stale("scout", SCOUT_EVERY) {
+            self.scan();
+        }
+        if stale("aegis-audit", AUDIT_EVERY) && git::recent_all(&self.cwd).len() > 3 {
+            self.audit();
+        }
+    }
+
     fn finish_task(&mut self) {
         if self.task_done.is_none() {
             self.task_done = Some(Instant::now());
@@ -1147,8 +1322,14 @@ impl App {
                 .unwrap_or(0);
             self.note(
                 "orda",
-                format!("the task is finished, in {}m{:02}s", took / 60, took % 60),
+                format!(
+                    "the task is finished, in {}m{:02}s, {} agent runs",
+                    took / 60,
+                    took % 60,
+                    self.runs
+                ),
             );
+            self.periodic_jobs();
             if self.cfg.notify.desktop && !self.demo_mode {
                 let _ = std::process::Command::new("notify-send")
                     .args(["-a", "orda", "orda: task finished", &self.task])
@@ -1192,11 +1373,12 @@ impl App {
         if self.task.is_empty() || self.task_done.is_some() || self.nudges >= MAX_NUDGES {
             return;
         }
-        let quiet =
-            self.agents.iter().all(|a| {
+        let quiet = self.later.is_empty()
+            && self.agents.iter().all(|a| {
                 !a.status.busy() && a.queue.is_empty() && a.inbox.is_empty() && !a.waiting
-            }) && self.flights.is_empty()
-                && self.questions.is_empty();
+            })
+            && self.flights.is_empty()
+            && self.questions.is_empty();
         if !quiet {
             self.quiet_since = None;
             return;
@@ -1222,7 +1404,13 @@ impl App {
         let pending: Vec<String> = self
             .checks
             .iter()
-            .map(|(h, (b, p))| format!("{h} on {b}: still checking {}", p.join(", ")))
+            .map(|(h, r)| {
+                format!(
+                    "{h} on {}: still checking {}",
+                    r.branch,
+                    r.pending.join(", ")
+                )
+            })
             .collect();
         let holds: Vec<String> = self
             .holds
@@ -1361,44 +1549,10 @@ impl App {
             start: Instant::now(),
             msg: id,
         });
-        // a claim about a commit goes to the referee, once per commit
-        let claimed = self
-            .messages
-            .last()
-            .map(|m| {
-                m.card
-                    .get("commit")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        let referee = self.agents.iter().position(|a| a.def.role == "referee");
-        if let Some(r) = referee
-            && matches!(kind.as_str(), "fixed" | "done")
-            && from != "referee"
-            && self.agents[r].def.name != to
-            && !claimed.is_empty()
-            && !self.demo_mode
-        {
-            let name = self.agents[r].def.name.clone();
-            let already = !self.verified.insert(claimed.clone())
-                || self.checks.iter().any(|(h, (_, p))| {
-                    (h.starts_with(&claimed) || claimed.starts_with(h.as_str()))
-                        && p.contains(&name)
-                });
-            if !already {
-                let msgs: Vec<&mail::Message> = self
-                    .messages
-                    .iter()
-                    .filter(|m| m.thread == thread)
-                    .collect();
-                let task = format!(
-                    "New commit {claimed} (claimed in #{id}). Verify this claim before anyone relies on it.\n\n{}",
-                    mail::prompt(&msgs, "referee")
-                );
-                self.queue_task(r, task);
+        if matches!(kind.as_str(), "bug" | "review") {
+            let branch = format!("wt/{to}");
+            for r in self.checks.values_mut().filter(|r| r.branch == branch) {
+                r.changes = true;
             }
         }
         // the same bug a third time: the pair is stuck, the boss and the advisor take a look
@@ -1677,7 +1831,7 @@ impl App {
             .rev()
             .filter(|c| !self.seen.contains(&c.0))
             .collect();
-        for (hash, subject) in fresh {
+        for (hash, _) in fresh {
             self.seen.insert(hash.clone());
             self.nudges = 0;
             let diff = git::show(&self.cwd, &hash);
@@ -1713,32 +1867,6 @@ impl App {
                     });
                 });
             }
-            // empty commits and notes or docs need no checking crew
-            let docs_only = files.iter().all(|f| f.ends_with(".md"));
-            if !self.cfg.watch.commits || docs_only {
-                continue;
-            }
-            let owners = work::owners(std::path::Path::new(&self.cwd), &hash);
-            let branch = owners
-                .first()
-                .map(|o| format!("wt/{o}"))
-                .or_else(|| self.git.as_ref().map(|g| g.branch.clone()))
-                .unwrap_or_default();
-            let mut pending = vec![];
-            for i in 0..self.agents.len() {
-                let d = &self.agents[i].def;
-                // customs only cares about what comes in from outside; nobody checks their own commit
-                if d.always_on && (d.role != "customs" || manifest) && !owners.contains(&d.name) {
-                    pending.push(d.name.clone());
-                    let task = format!(
-                        "New commit {hash} on {branch}: \"{subject}\". Check it as your role describes. Your folder is set to this commit."
-                    );
-                    self.queue_task(i, task);
-                }
-            }
-            if !pending.is_empty() && branch.starts_with("wt/") {
-                self.checks.insert(hash.clone(), (branch, pending));
-            }
         }
     }
 
@@ -1751,17 +1879,26 @@ impl App {
             return;
         };
         let hash = hash.to_string();
-        if let Some((_, pending)) = self.checks.get_mut(&hash) {
-            pending.retain(|n| n != who);
+        if let Some(r) = self.checks.get_mut(&hash) {
+            r.pending.retain(|n| n != who);
         }
         self.maybe_merge(&hash);
     }
 
+    fn main_branch(&self) -> String {
+        self.git
+            .as_ref()
+            .map(|g| g.branch.clone())
+            .filter(|b| !b.is_empty())
+            .unwrap_or("main".into())
+    }
+
+    /// A round of checks is in: merge when nothing was sent back and nothing holds it.
     fn maybe_merge(&mut self, hash: &str) {
-        let Some((branch, pending)) = self.checks.get(hash) else {
+        let Some(r) = self.checks.get(hash) else {
             return;
         };
-        if !pending.is_empty()
+        if !r.pending.is_empty()
             || self
                 .holds
                 .iter()
@@ -1769,22 +1906,190 @@ impl App {
         {
             return;
         }
-        let branch = branch.clone();
+        let (branch, changes, round) = (r.branch.clone(), r.changes, r.round);
         self.checks.remove(hash);
-        let main = self
-            .git
-            .as_ref()
-            .map(|g| g.branch.clone())
-            .unwrap_or("main".into());
+        if changes {
+            self.note(
+                "orda",
+                format!("{branch}: round {round} sent changes back, waiting for the builder"),
+            );
+            return;
+        }
+        let main = self.main_branch();
+        // the tester may have added tests on top of the work: merge those too
+        let tester_on_top = self
+            .agents
+            .iter()
+            .filter(|a| a.def.role == "tester")
+            .map(|a| format!("wt/{}", a.def.name))
+            .find(|t| {
+                let g = |args: &[&str]| {
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&self.cwd)
+                        .args(args)
+                        .output()
+                        .map(|o| {
+                            (
+                                o.status.success(),
+                                String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                            )
+                        })
+                };
+                g(&["merge-base", "--is-ancestor", hash, t]).is_ok_and(|(ok, _)| ok)
+                    && g(&["rev-list", "--count", &format!("{hash}..{t}")])
+                        .is_ok_and(|(_, n)| n != "0")
+            });
+        let also = tester_on_top
+            .map(|t| {
+                format!(", then `git merge --no-ff {t}` (the tester's new tests on top of it)")
+            })
+            .unwrap_or_default();
         self.note(
             "orda",
-            format!("{hash} passed every check, the boss can merge {branch}"),
+            format!("{branch} passed round {round}, the boss can merge it"),
         );
         if let Some(b) = self.agents.iter().position(|a| a.def.role == "boss") {
             let task = format!(
-                "Commit {hash} on {branch} passed every check and nothing holds it. If the work on that branch is finished, merge it: `git merge --no-ff {branch}` while on {main}. Then hand out what is next, or report the task finished."
+                "{branch} (at {hash}) passed its checks and nothing holds it. Merge it while on {main}: `git merge --no-ff {branch}`{also}. Then hand out what is next, or write FINISHED: when the whole task is merged and done."
             );
             self.queue_task(b, task);
+        }
+    }
+
+    /// Commit what a builder left uncommitted (codex cannot commit from its sandbox).
+    fn commit_leftovers(&mut self, i: usize) {
+        let a = &self.agents[i];
+        if !work::in_worktree(&a.def.role) || a.dir.as_os_str().is_empty() {
+            return;
+        }
+        let msg = a
+            .last_report
+            .lines()
+            .next()
+            .map(|l| short(l, 70))
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| format!("{}: {}", a.def.name, a.task));
+        match work::commit_all(&a.dir, &msg) {
+            Ok(true) => {
+                let name = a.def.name.clone();
+                self.note(&name, format!("orda committed what it left: {msg}"));
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let name = a.def.name.clone();
+                self.note(&name, format!("could not commit its work: {e}"));
+            }
+        }
+    }
+
+    /// A builder's run ended with new work on its branch: one round of checks on it.
+    /// At most MAX_ROUNDS per branch and task, then the boss decides.
+    pub(crate) fn start_checks(&mut self, i: usize) {
+        if !self.cfg.watch.commits {
+            return;
+        }
+        let name = self.agents[i].def.name.clone();
+        let branch = format!("wt/{name}");
+        let project = std::path::Path::new(&self.cwd).to_path_buf();
+        let main = self.main_branch();
+        let Some(tip) = work::tip(&project, &branch) else {
+            return;
+        };
+        if work::tip(&project, &main).as_deref() == Some(tip.as_str())
+            || work::is_merged(&project, &tip, &main)
+        {
+            return;
+        }
+        let (count, last) = self.rounds.get(&branch).cloned().unwrap_or_default();
+        if last == tip {
+            return;
+        }
+        if count >= MAX_ROUNDS {
+            self.note(
+                "orda",
+                format!("{branch} had {MAX_ROUNDS} check rounds: the boss decides"),
+            );
+            if let Some(b) = self.agents.iter().position(|a| a.def.role == "boss") {
+                self.queue_task(b, format!("{branch} went through {MAX_ROUNDS} rounds of checks and is at {tip}. Do not send it back again for small things: merge it if it works (`git merge --no-ff {branch}`), or hand out one precise fix."));
+            }
+            return;
+        }
+        let round = count + 1;
+        self.rounds.insert(branch.clone(), (round, tip.clone()));
+        // who checks: always the tester, the reviewer and the referee; the others when the change calls for them
+        let diff = work::diff(&project, &main, &tip);
+        let changed_existing = diff.lines().any(|l| l.starts_with("diff --git"))
+            && work::modified_existing(&project, &main, &tip);
+        let risky = [
+            "subprocess",
+            "os.system",
+            "eval(",
+            "exec(",
+            "shell=true",
+            "password",
+            "secret",
+            "token",
+            "select ",
+            "insert into",
+            "http://",
+            "https://",
+            "requests.",
+            "fetch(",
+            "pickle",
+            "yaml.load",
+            "process::command",
+            "unsafe ",
+        ]
+        .iter()
+        .any(|k| {
+            diff.to_lowercase()
+                .lines()
+                .filter(|l| l.starts_with('+'))
+                .any(|l| l.contains(k))
+        });
+        let manifest = diff
+            .lines()
+            .filter_map(|l| l.strip_prefix("+++ b/"))
+            .any(deps::is_manifest);
+        let wanted = |role: &str| match role {
+            "tester" | "reviewer" | "referee" => true,
+            "ripple" => changed_existing,
+            "aegis" => risky,
+            "customs" => manifest,
+            _ => false,
+        };
+        let task_title = self.agents[i].task.clone();
+        let mut pending = vec![];
+        for k in 0..self.agents.len() {
+            let d = &self.agents[k].def;
+            if d.name != name && wanted(&d.role) {
+                pending.push(d.name.clone());
+                let task = format!(
+                    "New commit {tip} on {branch}: the builder's work on \"{task_title}\", compared with {main}. Round {round} of at most {MAX_ROUNDS}. \
+                     Check it as your role describes. Send back only what must change (wrong, broken, unsafe, or missing from the task); \
+                     put everything else in your REPORT, it does not block the merge. Your folder is set to this commit."
+                );
+                self.queue_task(k, task);
+            }
+        }
+        self.note(
+            "orda",
+            format!(
+                "{branch} round {round}: {} checking {tip}",
+                pending.join(", ")
+            ),
+        );
+        if !pending.is_empty() {
+            self.checks.insert(
+                tip,
+                Round {
+                    branch,
+                    pending,
+                    changes: false,
+                    round,
+                },
+            );
         }
     }
 
@@ -1941,6 +2246,7 @@ impl App {
             guard_cmd: None,
             change: None,
             release: Some(hash.into()),
+            budget: false,
             asked: Instant::now(),
         });
         if self.agent_index("aegis").is_some() {
@@ -2022,6 +2328,7 @@ impl App {
                 guard_cmd: None,
                 change: None,
                 release: None,
+                budget: false,
                 asked: Instant::now(),
             }),
             roles::Line::Report(r) => {
@@ -2069,6 +2376,7 @@ impl App {
                         model,
                     }),
                     release: None,
+                    budget: false,
                     asked: Instant::now(),
                 });
             }
@@ -2211,7 +2519,8 @@ impl App {
                 a.now = short(&format!("{tool} {detail}"), 60);
                 a.status = Status::Running;
                 if matches!(tool.as_str(), "Bash" | "shell") {
-                    let verdict = guard::check(&self.cfg.guard, &detail);
+                    let verdict =
+                        guard::check(&self.cfg.guard, &detail, &a.dir.display().to_string());
                     if verdict != Verdict::Allow {
                         // claude runs are stopped by `orda hook`; codex stays inside its sandbox
                         let why = match (verdict, vendor.as_str()) {
@@ -2239,6 +2548,7 @@ impl App {
                                 guard_cmd: Some(detail.clone()),
                                 change: None,
                                 release: None,
+                                budget: false,
                                 asked: Instant::now(),
                             });
                         }
@@ -2305,6 +2615,15 @@ impl App {
                     self.after_run(i, &def, ok);
                 }
                 let goal = self.agents[i].goal.clone();
+                if ok
+                    && !self.demo_mode
+                    && matches!(def.role.as_str(), "builder" | "designer" | "tester")
+                {
+                    self.commit_leftovers(i);
+                }
+                if ok && !self.demo_mode && matches!(def.role.as_str(), "builder" | "designer") {
+                    self.start_checks(i);
+                }
                 self.check_done(&def.name, &goal);
                 self.next_queued(i);
             }
@@ -2667,99 +2986,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_builder_commit_is_checked_then_merged() {
-        let dir = std::env::temp_dir().join(format!("orda-flow-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        work::ensure_repo(&dir).unwrap();
-
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(true, tx);
-        app.demo_mode = false;
-        app.cfg.notify.desktop = false;
-        app.cwd = dir.display().to_string();
-        app.holds.clear();
-        app.git = git::snapshot(&app.cwd);
-        app.seen = git::recent_all(&app.cwd).into_iter().map(|c| c.0).collect();
-        // everyone is busy, so work is queued instead of starting a real run
-        for a in app.agents.iter_mut() {
-            a.status = Status::Running;
-        }
-
-        let main = app.git.as_ref().unwrap().branch.clone();
-        let wt = work::prepare(&dir, "builder", work::Job::Task { main: &main }).unwrap();
-        std::fs::write(wt.join("app.py"), "print('hi')\n").unwrap();
-        let g = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&wt)
-                .args(args)
-                .output()
-                .unwrap()
-        };
-        g(&["add", "."]);
-        g(&[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@example.com",
-            "commit",
-            "-qm",
-            "add app",
-        ]);
-        let hash = String::from_utf8(g(&["rev-parse", "--short", "HEAD"]).stdout)
-            .unwrap()
-            .trim()
-            .to_string();
-
-        app.watch_commits();
-        let (branch, pending) = app
-            .checks
-            .get(&hash)
-            .cloned()
-            .expect("the commit is being checked");
-        assert_eq!(branch, "wt/builder");
-        let mut want = vec!["tester", "ripple", "aegis", "referee", "reviewer"];
-        want.sort();
-        let mut got = pending.clone();
-        got.sort();
-        assert_eq!(
-            got, want,
-            "customs skips commits without a manifest, the builder does not check itself"
-        );
-
-        let boss = app.agent_index("boss").unwrap();
-        let goal = format!("New commit {hash} on wt/builder: \"add app\".");
-        for who in ["tester", "ripple", "aegis", "reviewer"] {
-            app.check_done(who, &goal);
-        }
-        assert!(
-            app.agents[boss].queue.is_empty(),
-            "no merge while the referee is still checking"
-        );
-        // the referee holds it; its run ends; still no merge
-        app.holds
-            .push((hash.clone(), "test bent".into(), "referee".into()));
-        app.check_done("referee", &goal);
-        assert!(app.agents[boss].queue.is_empty(), "no merge while held");
-        let r = app.agent_index("referee").unwrap();
-        app.agent_event(r, AgentEvent::Text(format!("RELEASE: {hash}")));
-        let task = app.agents[boss]
-            .queue
-            .back()
-            .expect("the boss is asked to merge");
-        assert!(task.contains("git merge --no-ff wt/builder") && task.contains(&hash));
-
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(["worktree", "remove", "-f", &wt.display().to_string()])
-            .output();
-        let _ = std::fs::remove_dir_all(work::base(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     fn real_app() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(true, tx);
@@ -2788,12 +3014,170 @@ mod tests {
         }
     }
 
+    /// A temporary repo where the builder has committed `files` on its branch.
+    fn repo_with_builder_commit(
+        app: &mut App,
+        tag: &str,
+        files: &[(&str, &str)],
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("orda-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        work::ensure_repo(&dir).unwrap();
+        app.cwd = dir.display().to_string();
+        app.git = git::snapshot(&app.cwd);
+        let main = app.main_branch();
+        let wt = work::prepare(&dir, "builder", work::Job::Task { main: &main }).unwrap();
+        for (f, text) in files {
+            std::fs::write(wt.join(f), text).unwrap();
+        }
+        work::commit_all(&wt, "add app").unwrap();
+        (dir, wt)
+    }
+
+    fn cleanup(dir: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(work::base(dir));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_handoff_gets_one_round_then_the_boss_merges() {
+        let mut app = real_app();
+        let (dir, _wt) =
+            repo_with_builder_commit(&mut app, "round", &[("app.py", "print('hi')\n")]);
+        // everyone is busy, so work is queued instead of starting real runs
+        for a in app.agents.iter_mut() {
+            a.status = Status::Running;
+        }
+        let b = app.agent_index("builder").unwrap();
+        app.start_checks(b);
+        let (tip, r) = app
+            .checks
+            .iter()
+            .next()
+            .map(|(h, r)| (h.clone(), r.clone()))
+            .expect("a round started");
+        let mut who = r.pending.clone();
+        who.sort();
+        assert_eq!(
+            who,
+            ["referee", "reviewer", "tester"],
+            "a new file with nothing risky: the three regular checkers only"
+        );
+        app.start_checks(b);
+        assert_eq!(app.checks.len(), 1, "the same tip is not checked twice");
+
+        let boss = app.agent_index("boss").unwrap();
+        let goal = format!("New commit {tip} on wt/builder");
+        for w in ["tester", "reviewer"] {
+            app.check_done(w, &goal);
+        }
+        assert!(
+            app.agents[boss].queue.is_empty(),
+            "no merge before the last check"
+        );
+        app.holds
+            .push((tip.clone(), "bent test".into(), "referee".into()));
+        app.check_done("referee", &goal);
+        assert!(app.agents[boss].queue.is_empty(), "no merge while held");
+        let r = app.agent_index("referee").unwrap();
+        app.agent_event(r, AgentEvent::Text(format!("RELEASE: {tip}")));
+        assert!(
+            app.agents[boss]
+                .queue
+                .back()
+                .expect("merge task")
+                .contains("git merge --no-ff wt/builder")
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn changes_sent_back_mean_no_merge_and_rounds_are_capped() {
+        let mut app = real_app();
+        let (dir, wt) = repo_with_builder_commit(&mut app, "cap", &[("app.py", "print(1)\n")]);
+        for a in app.agents.iter_mut() {
+            a.status = Status::Running;
+        }
+        let (b, boss) = (
+            app.agent_index("builder").unwrap(),
+            app.agent_index("boss").unwrap(),
+        );
+        for round in 1..=4u8 {
+            app.start_checks(b);
+            if round == 4 {
+                assert!(app.checks.is_empty(), "a fourth round does not start");
+                assert!(
+                    app.agents[boss]
+                        .queue
+                        .back()
+                        .unwrap()
+                        .contains("went through 3 rounds")
+                );
+                break;
+            }
+            let tip = app.checks.keys().next().unwrap().clone();
+            // the reviewer sends the builder a review card: changes requested
+            app.send("reviewer", card("builder", "review", ""));
+            for w in ["tester", "reviewer", "referee"] {
+                app.check_done(w, &format!("New commit {tip} on wt/builder"));
+            }
+            assert!(
+                !app.agents[boss]
+                    .queue
+                    .iter()
+                    .any(|t| t.contains("git merge")),
+                "round {round}: no merge after changes were asked"
+            );
+            // the builder fixes it: a new tip
+            std::fs::write(wt.join("app.py"), format!("print({})\n", round + 10)).unwrap();
+            work::commit_all(&wt, "fix").unwrap();
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn slots_budget_and_autopilot() {
+        let mut app = real_app();
+        app.task = "build x".into();
+        app.run_limit = 2;
+        app.runs = 2;
+        let t = app.agent_index("tester").unwrap();
+        app.start(t, "anything");
+        assert_eq!(
+            app.agents[t].status,
+            Status::Queued,
+            "over budget: it waits"
+        );
+        let q = app
+            .questions
+            .iter()
+            .find(|q| q.budget)
+            .expect("the owner is asked");
+        assert!(
+            !q.options.contains(&ACCEPT_ALL.to_string()),
+            "the budget always asks"
+        );
+        // autopilot answers an agent's question with its first option
+        app.autopilot = true;
+        app.agent_event(
+            t,
+            AgentEvent::Text("ASK: Which format? | JSON | TOML".into()),
+        );
+        assert!(!app.questions.iter().any(|q| q.text == "Which format?"));
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.who == "autopilot" && l.text.contains("JSON"))
+        );
+    }
+
     #[test]
     fn thanks_do_not_start_runs() {
         // the hello-orda run: referee and builder-2 woke each other with done and note cards ~20 times
         let mut app = real_app();
         let r = app.agent_index("referee").unwrap();
-        for kind in ["done", "note"] {
+        for kind in ["done", "note", "fixed"] {
             let id = app.send("builder-2", card("referee", kind, "")).unwrap();
             app.deliver(id);
         }
@@ -2801,22 +3185,9 @@ mod tests {
         assert!(app.agents[r].inbox.is_empty());
         assert_eq!(
             app.agents[r].mailbox.len(),
-            2,
-            "read at its next run instead"
+            3,
+            "read at its next run instead; a fix is checked by the next round"
         );
-    }
-
-    #[test]
-    fn the_referee_verifies_a_commit_once() {
-        let mut app = real_app();
-        let r = app.agent_index("referee").unwrap();
-        app.agents[r].status = Status::Running; // queue instead of starting a real run
-        app.send("builder-2", card("boss", "done", "c82501b"));
-        app.send("builder-2", card("tester", "done", "c82501b"));
-        app.send("builder-2", card("boss", "fixed", "c82501b"));
-        app.send("builder-2", card("boss", "done", ""));
-        assert_eq!(app.agents[r].queue.len(), 1);
-        assert!(app.agents[r].queue[0].starts_with("New commit c82501b"));
     }
 
     #[test]

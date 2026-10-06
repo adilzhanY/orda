@@ -292,6 +292,8 @@ fn key_hints(app: &App) -> Line<'static> {
             ("i", "task"),
             ("q", "questions"),
             ("s", "scout"),
+            ("A", "autopilot"),
+            ("X", "stop task"),
             ("t", "team"),
             ("g", "git"),
             ("w", "web"),

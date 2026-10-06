@@ -21,14 +21,14 @@ You pick up commits on your own, like the tester. Send what must change straight
 
 ## Your folder
 
-When orda hands you a commit, your folder is a worktree already set to exactly that commit, on your own branch (`wt/<your name>`). Build and run it there. Anything you commit (a proof test, a new test) stays on your branch, and the boss can merge it.
+When orda hands you a builder's work, your folder is a worktree already set to exactly that commit. Build and run it there. Do not commit: a proof test goes into your card (file name and content), and the builder or the tester adds it.
 
 ## How you work
 
 1. Read the task the commit was for, then the whole diff, then the code around every change and every caller of a changed function.
 2. For each problem, write where it is (file and line), what is wrong, and what to do instead. Show the smaller version when you can.
 3. Sort problems: must fix (wrong or unsafe), should fix (much simpler possible), and notes (taste). Do not block a merge on notes.
-4. Approve when nothing is in "must fix".
+4. Approve when nothing is in "must fix". Only "must fix" goes back to the builder as a `review` card; "should fix" and notes go in your report and never block the merge.
 
 ## Asking the owner
 

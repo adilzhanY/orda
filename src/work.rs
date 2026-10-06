@@ -171,12 +171,42 @@ pub fn author(project: &Path, commit: &str) -> Option<String> {
     branches.first().map(|b| b.to_string())
 }
 
-/// The agent whose `wt/` branch a commit was made on.
-pub fn owners(project: &Path, commit: &str) -> Vec<String> {
-    author(project, commit)
-        .and_then(|b| b.strip_prefix("wt/").map(String::from))
-        .into_iter()
-        .collect()
+pub fn tip(project: &Path, branch: &str) -> Option<String> {
+    git(project, &["rev-parse", "--short", branch])
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+pub fn is_merged(project: &Path, commit: &str, into: &str) -> bool {
+    git(project, &["merge-base", "--is-ancestor", commit, into]).is_ok()
+}
+
+/// What a branch adds compared with main.
+pub fn diff(project: &Path, main: &str, tip: &str) -> String {
+    git(project, &["diff", &format!("{main}...{tip}")]).unwrap_or_default()
+}
+
+/// True when the branch changed files that already existed on main (not only new ones).
+pub fn modified_existing(project: &Path, main: &str, tip: &str) -> bool {
+    git(
+        project,
+        &["diff", "--name-status", &format!("{main}...{tip}")],
+    )
+    .unwrap_or_default()
+    .lines()
+    .any(|l| l.starts_with(['M', 'D', 'R']))
+}
+
+/// Commit everything in a worktree. Ok(false) when there was nothing to commit.
+pub fn commit_all(dir: &Path, msg: &str) -> Result<bool, String> {
+    if git(dir, &["status", "--porcelain"])?.is_empty() {
+        return Ok(false);
+    }
+    git(dir, &["add", "-A"])?;
+    let mut args = identity(dir);
+    args.extend(["commit", "-q", "-m", msg].map(String::from));
+    git(dir, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -220,7 +250,7 @@ mod tests {
         let wt = prepare(&dir, "builder", Job::Task { main: &main }).unwrap();
         assert!(wt.starts_with(base(&dir)) && wt.ends_with("builder"));
         let c = commit(&wt, "a.txt", "one");
-        assert_eq!(owners(&dir, &c), ["builder"]);
+        assert_eq!(author(&dir, &c).as_deref(), Some("wt/builder"));
         assert!(
             !dir.join("a.txt").exists(),
             "the owner's checkout is untouched"
@@ -229,7 +259,7 @@ mod tests {
         // a checker gets that exact commit, and the commit still belongs to the builder
         let chk = prepare(&dir, "tester", Job::Check { commit: &c }).unwrap();
         assert_eq!(std::fs::read_to_string(chk.join("a.txt")).unwrap(), "one");
-        assert_eq!(owners(&dir, &c), ["builder"]);
+        assert_eq!(author(&dir, &c).as_deref(), Some("wt/builder"));
 
         // unmerged work survives the next task
         let wt = prepare(&dir, "builder", Job::Task { main: &main }).unwrap();

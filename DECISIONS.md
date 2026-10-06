@@ -297,3 +297,17 @@ While designing it, thinking like aegis found a real hole in orda: the guard did
 - **Tokens were overcounted** about tenfold by counting cache reads, which repeat every turn. Spent tokens now leave out cache reads (Claude) and cached input (Codex).
 - **The git panel hid the work.** It listed only the main branch's commits. It now lists every branch's commits with the branch each was made on (found in the branch reflogs, since checkers' branches contain the commits they check), and each worktree with how many commits it has left to merge.
 - **There was no log to read afterwards.** Every log line also goes to `~/.local/share/orda/logs/<project>.log`.
+
+## 27. Checks per hand-off, a budget, and autopilot
+
+2026-10-06
+
+**Context:** the second real run ("build a command line todo app in Python...") went 27 minutes and 299 agent runs without delivering: the app sat unmerged on a branch while the team polished the test file. The log showed why. Every commit woke five checkers; each found one more small thing; each fix was a new commit. Codex could not commit at all (its sandbox keeps `.git` read-only, and a worktree's git data lives in the project's `.git`). The guard asked about every `rm -rf` of a temp folder (92 questions). The owner's own Claude Code hooks and Codex notify script ran inside every agent, so every finished run made a notification and a sound.
+
+**Decision:**
+- **One round of checks per hand-off, not per commit.** When a builder's run ends with new work on its branch, orda commits what it left uncommitted (that is how Codex builders get committed) and starts one round: the tester, the reviewer and the referee, plus ripple only if existing files changed, aegis only if the added lines touch risky code, customs only if a manifest changed. At most 3 rounds per branch per task; after that the boss decides. A `bug` or `review` card back to the builder during a round means no merge; otherwise the boss is asked to merge (and to merge the tester's added tests with it). Checkers send back only must-fix problems. Checkers other than the tester do not commit.
+- **`fixed` and `done` cards no longer start anyone.** The next round checks a fix.
+- **A budget.** At most 4 runs at once (`[budget] parallel`); a task that has started 60 runs asks the owner to go on or stop (`runs_per_task`). Shift+X stops the task. The scout, bursar and audit run only after a task is finished.
+- **Autopilot.** Every question an agent asks gets an "accept all from now on" option, and Shift+A or `autopilot = true` turns it on: agents' questions are answered with their recommended (first) option. Guard commands, the budget question and leaked secrets still ask.
+- **The guard lets agents clean up after themselves:** a recursive `rm` inside the agent's folder or `/tmp` passes; outside them it asks. `rm -rf *` left the ask list.
+- **Agent runs leave the owner's setup alone:** Claude runs with `--setting-sources project,local` (no user hooks, notifications or session-start context), Codex with `notify=[]`.

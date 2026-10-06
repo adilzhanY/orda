@@ -111,6 +111,12 @@ orda's guard checks every shell command.
 - **Never** read or print secrets: tokens, keys, `.env` files, credential stores. Never put a real key, password, email address or other personal data into code, tests, fixtures or logs; use obvious placeholders. orda scans every new commit and holds it when it finds one.
 - Stay inside the project directory.
 
+## How work gets checked
+
+When a builder's run ends with new work on its branch, orda starts one round of checks on it: the tester, the reviewer and the referee every time, ripple when existing files changed, aegis when the change touches risky code, customs when a dependency changed. A branch gets at most three rounds per task.
+
+If you check work: send back only what must change, meaning it is wrong, broken, unsafe, or missing from the task. Everything else (style, nicer names, extra tests that would be good to have) goes in your `REPORT:` and does not stop the merge. Polishing a working change round after round costs the owner's limits and delivers nothing. When every checker is done, nothing was sent back and nothing holds the branch, orda asks the boss to merge it.
+
 ## Where you work
 
 orda puts you in the right folder before your run starts; do not change it.
